@@ -559,7 +559,9 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    from cs336_basics.get_tokenizer import Tokenizer
+    tokenizer=Tokenizer(vocab,merges,special_tokens)
+    return tokenizer
 
 
 def run_train_bpe(
@@ -589,29 +591,11 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    from cs336_basics.pretokenization_example import find_chunk_boundaries
-    #预分词
-    with open(input_path,"rb") as f:
-        num_processes=4
-        vocab=[]
+
+    from cs336_basics.get_tokenizer import train_bpe1
+
+    vocab,merges=train_bpe1(input_path,vocab_size,special_tokens=special_tokens)
+    return vocab,merges
 
 
 
-
-        boundaries=find_chunk_boundaries(f,num_processes,b'<|endoftext|>')
-
-        for start ,end in zip(boundaries[:-1],boundaries[1:]):
-            f.seek(start)
-            chunk=f.read(end-start).decode('utf-8',errors='ignore')
-
-
-
-
-
-
-
-
-
-
-
-    raise NotImplementedError
