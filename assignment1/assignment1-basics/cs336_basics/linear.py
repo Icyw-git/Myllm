@@ -30,7 +30,7 @@ def embedding(vocab_size: int,
     return embeddings
 
 def silu(in_features: Float[Tensor, " ... d_model"]):
-    return in_features*torch.sigmoid(in_features)
+    return in_features*torch.sigmoid(in_features) #逐元素相乘，注意sigmoid的使用
 
 def swiglu(d_model: int,
     d_ff: int,
@@ -58,7 +58,7 @@ def scaled_dot_product_attention(Q: Float[Tensor, " ... queries d_k"],
     # import linear 失败，连 softmax 测试都会挂。没写完时先 raise。
 
     d_k=Q.shape[-1]
-    scores=einops.einsum(Q,K," ... queries d_k, ... keys d_k->... queries keys")/math.sqrt(d_k)
+    scores=einops.einsum(Q,K," ... queries d_k, ... keys d_k->... queries keys")/math.sqrt(d_k) #注意mask的位置
     if mask is not None:
         scores=scores.masked_fill(~mask,float("-inf"))
     scores=softmax(scores,dim=-1)
@@ -70,7 +70,7 @@ def rmsnorm(
     weights: Float[Tensor, " d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    temp=torch.sqrt(torch.mean(in_features**2,dim=-1,keepdim=True)+eps)
+    temp=torch.sqrt(torch.mean(in_features**2,dim=-1,keepdim=True)+eps) #注意keepdim和dim的使用
     return in_features/temp*weights
 
 def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device: str):
