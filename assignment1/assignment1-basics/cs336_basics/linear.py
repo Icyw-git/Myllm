@@ -43,11 +43,12 @@ def swiglu(d_model: int,
     Linear3=Linear(d_ff,d_model,w3_weight)
     return Linear2(silu(Linear1(in_features))*Linear3(in_features))
 
-def softmax(in_features: Float[Tensor, " ... d_model"],dim: int):
+def softmax(in_features: Float[Tensor, " ... d_model"],dim: int): #这是softmax的变体，使用log-sum-exp技巧避免数值溢出
     x_max=torch.max(in_features,dim=dim,keepdim=True)[0]
     x=in_features-x_max
-    exp_sum=torch.sum(torch.exp(x),dim=dim,keepdim=True)
-    return torch.exp(x)/exp_sum
+    log_sum=torch.log(torch.sum(torch.exp(x),dim=dim,keepdim=True)) #写的时候注意dim和keepdim的使用,作用是保持维度不变，避免广播错误
+    logp=x-log_sum
+    return torch.exp(logp)
 
 
 def scaled_dot_product_attention(Q: Float[Tensor, " ... queries d_k"],
@@ -70,7 +71,7 @@ def rmsnorm(
     weights: Float[Tensor, " d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    temp=torch.sqrt(torch.mean(in_features**2,dim=-1,keepdim=True)+eps) #注意keepdim和dim的使用
+    temp=torch.sqrt(torch.mean(in_features**2,dim=-1,keepdim=True)+eps) #注意keepdim和dim的使用,目的是保持维度不变，避免广播错误，eps是为了避免分母为0
     return in_features/temp*weights
 
 def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device: str):
@@ -84,13 +85,12 @@ def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device
     return torch.tensor(inputs,dtype=torch.long,device=device),torch.tensor(outputs,dtype=torch.long,device=device)
     
 def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]):
-    scores=torch.log(softmax(inputs,dim=-1))
-    batch_idx=torch.arange(inputs.shape[0])
-    probs=scores[batch_idx,targets]
-
-
-    return -torch.mean(probs)
-
+    x_max=torch.max(inputs,dim=-1,keepdim=True)[0] #注意keepdim和dim的使用
+    x=inputs-x_max
+    log_sum=torch.log(torch.sum(torch.exp(x),dim=-1,keepdim=True)) #注意keepdim和dim的使用
+    logp=x-log_sum
+    prob=logp[torch.arange(targets.shape[0]),targets] #注意targets的使用
+    return -torch.mean(prob)
 
 
 
