@@ -92,5 +92,144 @@ def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[
     prob=logp[torch.arange(targets.shape[0]),targets] #注意targets的使用
     return -torch.mean(prob)
 
+def multihead_self_attention(
+    d_model: int,
+    num_heads: int,
+    q_proj_weight: Float[Tensor, " d_model d_model"],
+    k_proj_weight: Float[Tensor, " d_model d_model"],
+    v_proj_weight: Float[Tensor, " d_model d_model"],
+    o_proj_weight: Float[Tensor, " d_model d_model"],
+    in_features: Float[Tensor, " ... sequence_length d_model"],
+) -> Float[Tensor, " ... sequence_length d_model"]:
+    *prefix,seq_len,d_model=in_features.shape
+
+    seq_len=in_features.shape[-2]
+    in_features=in_features.view(-1,seq_len,d_model)
+    batch_size=in_features.shape[0]
+
+    Q=in_features @ q_proj_weight.T
+    K=in_features @ k_proj_weight.T
+    V=in_features @v_proj_weight.T
+
+
+
+    d_k=d_model // num_heads
+    Q=Q.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
+    V=V.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
+    K=K.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
+
+    scores=torch.matmul(Q,K.transpose(-2,-1))/math.sqrt(d_k)
+    mask=torch.triu(torch.ones(seq_len,seq_len),diagonal=1) #生成上三角矩阵，用于遮蔽未来的token
+    scores=scores.masked_fill(mask,float("-inf")) #1的位置设为-inf，避免softmax时出现无穷大
+    scores=softmax(scores,dim=-1)
+
+    results=torch.matmul(scores,V)
+    results=results.transpose(1,2).contiguous().view(batch_size,seq_len,d_model)
+
+    outputs=torch.matmul(results,o_proj_weight.T)
+    outputs=outputs.view(*prefix,seq_len,d_model)
+    return outputs
+
+
+def rope(
+    d_k: int,
+    theta: float,
+    max_seq_len: int,
+    in_query_or_key: Float[Tensor, " ... sequence_length d_k"],
+    token_positions: Int[Tensor, " ... sequence_length"],
+) -> Float[Tensor, " ... sequence_length d_k"]:
+    assert d_k %2==0
+    *prefix,seq_len,d_k=in_query_or_key.shape
+    freq_seq=torch.arange(0,d_k,2,dtype=torch.float32)/d_k #这里是为了生成频率序列，步长为2，范围从0到d_k，除以d_k是为了归一化
+    rope_theta=1/theta**freq_seq #生成角度序列，1/theta**freq_seq是为了生成不同频率的角度，形状为(d_k//2,)
+    angles=token_positions.unsqueeze(-1)*rope_theta #使用unsqueeze(-1)将token_positions的形状从(..., seq_len)变为(..., seq_len, 1)，然后与rope_theta相乘，得到每个token位置对应的角度，形状为(..., seq_len, d_k//2)，便于广播
+    cos=angles.cos()
+    sin=angles.sin()
+    x=in_query_or_key.view(*prefix,seq_len,d_k//2,2)
+    rope_x=torch.stack([
+        x[...,0]*cos-x[...,1]*sin,
+        x[...,0]*sin+x[...,1]*cos],
+        dim=-1
+    ) #这里是将旋转后的结果堆叠起来，dim=-1表示在最后一个维度上堆叠，得到形状为(..., seq_len, d_k//2, 2)
+
+    rope_x=rope_x.view(*prefix,seq_len,d_k)
+
+    return rope_x
+
+def multihead_self_attention_with_rope(
+    d_model: int,
+    num_heads: int,
+    max_seq_len: int,
+    theta: float,
+    q_proj_weight: Float[Tensor, " d_model d_model"],
+    k_proj_weight: Float[Tensor, " d_model d_model"],
+    v_proj_weight: Float[Tensor, " d_model d_model"],
+    o_proj_weight: Float[Tensor, " d_model d_model"],
+    in_features: Float[Tensor, " ... sequence_length d_model"],
+    token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+) -> Float[Tensor, " ... sequence_length d_model"]:
+    *prefix,seq_len,d_model=in_features.shape #保存前导维度，seq_len是序列长度，d_model是特征维度
+    in_features=in_features.view(-1,seq_len,d_model)
+    batch_size=in_features.shape[0]
+    
+    Q=in_features@q_proj_weight.T
+    K=in_features@k_proj_weight.T
+    V=in_features@v_proj_weight.T #注意转置
+
+    d_k=d_model // num_heads #必须使用// 不然会返回浮点数，后续的view会报错
+    assert d_k==d_model // num_heads
+    Q=Q.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
+    K=K.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
+    V=V.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
+
+
+    freq_seq=torch.arange(0,d_k,2,dtype=torch.float32)/d_k
+    rope_theta=1/theta**freq_seq
+    angles=token_positions.unsqueeze(-1)*rope_theta
+    cos=angles.cos()
+    sin=angles.sin()
+    Q=Q.view(batch_size,num_heads,seq_len,d_k//2,2)
+    rope_Q=torch.stack([
+        Q[...,0]*cos-Q[...,1]*sin,
+        Q[...,0]*sin+Q[...,1]*cos
+    ],dim=-1)
+    rope_Q=rope_Q.view(batch_size,num_heads,seq_len,d_k) #注意这里的view是为了将最后一个维度从2恢复到d_k
+
+    freq_seq=torch.arange(0,d_k,2,dtype=torch.float32)/d_k
+    rope_theta=1/theta**freq_seq
+    angles=token_positions.unsqueeze(-1)*rope_theta
+    cos=angles.cos()
+    sin=angles.sin()
+    K=K.view(batch_size,num_heads,seq_len,d_k//2,2)
+
+    rope_K=torch.stack([
+        K[...,0]*cos-K[...,1]*sin,
+        K[...,0]*sin+K[...,1]*cos
+    ],dim=-1)
+    rope_K=rope_K.view(batch_size,num_heads,seq_len,d_k)
+
+
+
+    scores=torch.matmul(rope_Q,rope_K.transpose(-2,-1))/math.sqrt(d_k)
+    mask=torch.triu(torch.ones(seq_len,seq_len,dtype=torch.bool),diagonal=1) #diagonal=1表示上三角矩阵的对角线以上部分为True，其他部分为False
+    scores=scores.masked_fill(mask,float("-inf"))
+    attn=softmax(scores,dim=-1)
+    results=torch.matmul(attn,V)
+    results=results.transpose(1,2).contiguous().view(batch_size,seq_len,d_model) #注意这里的contiguous()是为了保证内存连续性，避免view报错
+    outputs=results@o_proj_weight.T
+    outputs=outputs.view(*prefix,seq_len,d_model)
+    return outputs
+
+
+
+    
+
+
+    
+
+
+
+
+
 
 
