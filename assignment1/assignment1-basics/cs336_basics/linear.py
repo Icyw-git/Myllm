@@ -1,5 +1,5 @@
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO,Tuple
 
 import numpy.typing as npt
 import torch
@@ -10,6 +10,8 @@ import torch.nn.functional as F
 import einops
 import math
 import numpy as np
+import os
+
 
 
 class Linear(nn.Module):
@@ -417,6 +419,129 @@ def transformer_lm(
     # 输出是未归一化 logits，不要再 softmax
     x=x@weights["lm_head.weight"].T
     return x
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+    grads=[] # 存储所有参数的梯度
+    for p in parameters:
+        if p.grad is not None:
+            grads.append(p.grad.view(-1)) # 将梯度展平成一维
+
+    if grads is None: # 没有梯度，直接返回
+        l2=0.0
+
+
+    grads=torch.cat(grads)
+    eps=1e-5
+    l2=torch.sqrt(torch.sum(grads**2)).item() #计算l2范数，注意返回值是标量，不是张量
+    if l2>max_l2_norm:
+        scale=max_l2_norm/(l2+eps) #计算缩放因子，避免除以0
+        for p in parameters: # 对每个参数，按比例缩放梯度
+            if p.grad is not None:
+                p.grad.mul_(scale) # 缩放梯度
+
+
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self,parameters: Iterable[torch.nn.Parameter],lr: float,betas: Tuple[float, float],eps: float,weight_decay: float):
+        defaults={
+            "lr":lr,
+            "betas":betas,
+            "eps":eps,
+            "weight_decay":weight_decay,
+            "step":0
+        }
+        super().__init__(parameters,defaults)
+
+    def step(self,closure=None):
+        with torch.no_grad():
+            loss=None #损失值，这里不用计算损失函数，因为AdamW的step方法会自动计算损失函数
+            if closure is not None: #closure作用是计算损失函数，并返回损失值
+                loss=closure()
+            for group in self.param_groups: #遍历所有参数组，每个参数组包含一个学习率和两个动量参数，为什么要「组」？
+                #同一优化器里，不同参数可以有不同学习率 / weight decay，所以需要「组」来管理这些参数
+                lr=group["lr"] #学习率
+                beta1,beta2=group["betas"] #两个动量参数
+                eps=group["eps"] #防止分母为0的常数
+                weight_decay=group["weight_decay"] #权重衰减系数
+                step=group["step"] #步数
+                for p in group["params"]: #遍历所有参数，这里的参数和param_group的params是同一个参数
+                    if p.grad is not None:
+                        grad=p.grad.data #data属性是张量的原始数据，grad是梯度，现在一般不建议使用操作data,直接使用no_grad()上下文管理器防止梯度图错误
+                        state=self.state[p] #state是字典，存储了参数的动量和平方动量
+                        if len(state)==0:
+                            state['step']=0
+                            state["exp_avg"]=torch.zeros_like(p.data)
+                            state["exp_avg_sq"]=torch.zeros_like(p.data)
+                        state['step']+=1
+                        t=state['step']
+                        exp_avg,exp_avg_sq=state["exp_avg"],state["exp_avg_sq"]
+                        exp_avg=exp_avg*beta1+(1-beta1)*grad
+                        exp_avg_sq=exp_avg_sq*beta2+(1-beta2)*(grad**2)
+                        bias_correction1=1-beta1**t
+                        bias_correction2=1-beta2**t
+                        denom=torch.sqrt(exp_avg_sq/bias_correction2)+eps
+                        step_size=lr*exp_avg/bias_correction1/denom
+                        if weight_decay!=0:
+                            p.data=p.data-step_size-lr*weight_decay*p.data
+                        else:
+                            p.data=p.data-step_size
+                        state["exp_avg"]=exp_avg
+                        state["exp_avg_sq"]=exp_avg_sq
+            return loss
+
+
+
+def get_adamw_cls() -> Any:
+    """
+    Returns a torch.optim.Optimizer that implements AdamW.
+    """
+    return AdamW
+    
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+):
+    if it < warmup_iters:
+        lr=max_learning_rate*(it/warmup_iters)
+    elif warmup_iters<=it <=cosine_cycle_iters:
+        progress=(it-warmup_iters)/(cosine_cycle_iters-warmup_iters)
+
+        lr=min_learning_rate+0.5*(max_learning_rate-min_learning_rate)*(1+math.cos(math.pi*progress))
+    else:
+        lr=min_learning_rate
+    return lr
+    
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes],
+):
+    dict={
+        'model_state_dict':model.state_dict(),
+        'optimizer_state_dict':optimizer.state_dict(),
+        'iteration':iteration,
+    }
+    torch.save(dict,out)
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+):
+    dict=torch.load(src)
+    model.load_state_dict(dict['model_state_dict'])
+    optimizer.load_state_dict(dict['optimizer_state_dict'])
+
+    return dict['iteration']
+
+
+
+    
 
 
 
