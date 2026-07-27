@@ -14,7 +14,7 @@ dependencies = [
     "pytest-timeout",
     "regex>=2026.3.32", # more powerful regex than the builtin `re` module
     "tiktoken>=0.12.0",
-    "torch~=2.11.0",
+    "torch==2.11.0+cu128",
     "tqdm>=4.67",
     "wandb>=0.25",
     "ty>=0.0.26",
@@ -32,6 +32,15 @@ module-root = ""
 [tool.uv]
 package = true
 python-preference = "managed"
+
+# GPU 驱动 CUDA 12.8：必须从 PyTorch cu128 索引装 wheel，否则 uv sync 会装清华源的 cu130。
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
 
 [tool.pytest.ini_options]
 log_cli = true

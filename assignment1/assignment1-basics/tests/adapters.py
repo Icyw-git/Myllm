@@ -609,9 +609,10 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
 
-    from cs336_basics.get_tokenizer import train_bpe1
+    from cs336_basics.train_bpe import BPE
+    bpe=BPE(special_tokens)
 
-    vocab,merges=train_bpe1(input_path,vocab_size,special_tokens=special_tokens)
+    vocab,merges=bpe.train(input_path,vocab_size,**kwargs)
     return vocab,merges
 
 

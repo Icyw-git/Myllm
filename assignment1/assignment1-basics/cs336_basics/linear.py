@@ -83,14 +83,23 @@ def rmsnorm(
     return in_features/temp*weights
 
 def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device: str):
+    # 错过：max_start=len-context_length 且 randint(0, max_start+1) 会抽到 start=len-cl。
+    # 此时 x 长 cl、y=dataset[start+1:start+cl+1] 只有 cl-1 → torch.tensor 报
+    # expected sequence of length 6 at dim 1 (got 7)。
+    # 正确：窗口要 cl+1 个 token；合法 start 是 0..len-cl-1，
+    # 即 max_start=len-cl，randint 上界用 max_start（不含）。
     max_start=len(dataset)-context_length
-    starts=np.random.randint(0,max_start+1,size=(batch_size,))
+    starts=np.random.randint(0,max_start,size=(batch_size,))
     inputs=[]
     outputs=[]
     for i,start in enumerate(starts):
         inputs.append(dataset[start:start+context_length])
         outputs.append(dataset[start+1:start+context_length+1])
-    return torch.tensor(inputs,dtype=torch.long,device=device),torch.tensor(outputs,dtype=torch.long,device=device)
+    # 错过：torch.tensor(list_of_ndarrays) 又慢又在长度不一致时难读。
+    # 正确：先 np.stack(..., axis=0) 得到 (B, cl)，再 from_numpy。
+    inputs=np.stack(inputs,axis=0)
+    outputs=np.stack(outputs,axis=0) # stack 在最前新建一维：(B, context_length)
+    return torch.from_numpy(inputs).to(device),torch.from_numpy(outputs).to(device)
     
 def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]):
     # 错过：先 softmax 再 log —— logits 很大时 softmax 变 inf，log 后全坏。
@@ -130,7 +139,10 @@ def multihead_self_attention(
     K=K.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
 
     scores=torch.matmul(Q,K.transpose(-2,-1))/math.sqrt(d_k)
-    mask=torch.triu(torch.ones(seq_len,seq_len),diagonal=1) #生成上三角矩阵，用于遮蔽未来的token
+    mask=torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=in_features.device),
+        diagonal=1,
+    )  # 生成上三角矩阵，用于遮蔽未来的token
     scores=scores.masked_fill(mask,float("-inf")) #1的位置设为-inf，避免softmax时出现无穷大
     scores=softmax(scores,dim=-1)
 
@@ -156,12 +168,17 @@ def rope(
     # 变成 θ^{-0},θ^{-2},θ^{-4}...；pos0 和第一对碰巧还能对上，后面全炸。
     # 正确：讲义 θ^{-2i/d}，即 (0,2,4,...)/d_k 再放进指数。
     freq_seq=torch.arange(0,d_k,2,dtype=torch.float32)/d_k
-    rope_theta=1/theta**freq_seq #形状 (d_k//2,)
-    # unsqueeze(-1)：(..., seq_len) -> (..., seq_len, 1)，和 rope_theta 广播成 (..., seq_len, d_k//2)
+    rope_theta=1/theta**freq_seq # (d_k//2,) 每对维度一个频率
+    # angles 广播（PyTorch 从右边对齐）：
+    #   token_positions: (..., S)
+    #   unsqueeze(-1)  → (..., S, 1)     # 给频率维留位置
+    #   rope_theta     → (d_k//2,)
+    #   (..., S, 1) * (d_k//2,) → (..., S, d_k//2)
+    # 含义：angles[..., s, i] = position[..., s] * ω[i]
     angles=token_positions.unsqueeze(-1)*rope_theta
     cos=angles.cos()
     sin=angles.sin()
-    # 成对 (x0,x1),(x2,x3),... 做二维旋转
+    # 成对 (x0,x1),(x2,x3),... 做二维旋转；x 与 cos 都是 (..., S, d_k//2) 可直接乘
     x=in_query_or_key.view(*prefix,seq_len,d_k//2,2)
     rope_x=torch.stack([
         x[...,0]*cos-x[...,1]*sin,
@@ -202,11 +219,25 @@ def multihead_self_attention_with_rope(
     V=V.view(batch_size,seq_len,num_heads,d_k).transpose(1,2)
 
     # 对每个 head 的 d_k 维做 RoPE（频率公式同 rope()，别忘了 /d_k）
-    freq_seq=torch.arange(0,d_k,2,dtype=torch.float32)/d_k
+    #
+    # --- angles 怎么对齐（同 rope）---
+    #   positions (B,S) → unsqueeze(-1) → (B,S,1)
+    #   rope_theta (d_k/2,) 从右边广播
+    #   (B,S,1)*(d_k/2,) → (B,S,d_k/2) = angles
+    #
+    # --- 乘到 Q/K 时的第二步广播（这里容易错）---
+    #   拆 head 后 Q[...,0] 是 (B, H, S, d_k/2)
+    #   若直接用 cos=(B,S,d_k/2)，从右边对齐会变成：
+    #        Q:  B, H, S, d_k/2
+    #       cos:    B, S, d_k/2
+    #   → dim1 拿 H 去对 B。测试里常 B==H==4 碰巧过；训练 B=8,H=16 就炸：
+    #     size a (16) must match b (8) at non-singleton dimension 1
+    #   正确：cos/sin 再 unsqueeze(1) → (B, 1, S, d_k/2)，在 head 维广播。
+    freq_seq=torch.arange(0,d_k,2,dtype=in_features.dtype,device=in_features.device)/d_k
     rope_theta=1/theta**freq_seq
-    angles=token_positions.unsqueeze(-1)*rope_theta
-    cos=angles.cos()
-    sin=angles.sin()
+    angles=token_positions.to(in_features.device).unsqueeze(-1)*rope_theta  # (B,S,d_k/2)
+    cos=angles.cos().unsqueeze(1)  # (B,1,S,d_k/2)
+    sin=angles.sin().unsqueeze(1)
     Q=Q.view(batch_size,num_heads,seq_len,d_k//2,2)
     rope_Q=torch.stack([
         Q[...,0]*cos-Q[...,1]*sin,
@@ -223,7 +254,10 @@ def multihead_self_attention_with_rope(
 
     scores=torch.matmul(rope_Q,rope_K.transpose(-2,-1))/math.sqrt(d_k)
     # diagonal=1：严格上三角为 True，盖掉未来 token
-    mask=torch.triu(torch.ones(seq_len,seq_len,dtype=torch.bool),diagonal=1)
+    mask=torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=in_features.device),
+        diagonal=1,
+    )
     scores=scores.masked_fill(mask,float("-inf"))
     attn=softmax(scores,dim=-1)
     results=torch.matmul(attn,V)

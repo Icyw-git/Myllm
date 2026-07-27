@@ -1,6 +1,8 @@
 import regex as re
 import os
-from collections import Counter
+# 错过：用了 defaultdict 却只 from collections import Counter → NameError。
+# 正确：from collections import Counter, defaultdict
+from collections import Counter, defaultdict
 
 class BPE:
     def __init__(self,special_tokens: list[str]):
@@ -34,35 +36,50 @@ class BPE:
             tokens=[bytes([b]) for b in word.encode('utf-8')]
             word_freq[tuple(tokens)]+=1
 
+        # 增量 BPE：pair_counts 全局频次；pair_to_words 倒排（哪些 word 含该 pair）
+        # defaultdict(set)：key 不存在时自动空 set，可直接 .add
+        pair_counts=Counter()
+        pair_to_words=defaultdict(set)
+        for tokens,freq in word_freq.items():
+            for i in range(len(tokens)-1):
+                pair_counts[(tokens[i],tokens[i+1])]+=freq
+                pair_to_words[(tokens[i],tokens[i+1])].add(tokens)
+
         # 错过：把 merges=[] 放进 while 里，每轮清空，最后只剩 1 条 merge
         merges=[]
 
         while len(vocab)<vocab_size:
-            pairs=Counter()
-
-            for tokens,freq in word_freq.items():
-                for i in range(len(tokens)-1):
-                    pairs[(tokens[i],tokens[i+1])]+=freq
-            if not pairs:
+            if not pair_counts:
                 break
             # 错过：max(pairs, key=pairs.get) —— 频次相同时只按遍历顺序，
             # 会和 reference 在某步分叉（如 index 64: (b'c',b'e') vs (b'l',b'e')）。
             # 平局时要按讲义对 pair 做字典序比较（这里用 (频次, pair)）。
-            best_pair=max(pairs,key=lambda x: (pairs[x],x))
+            best_pair=max(pair_counts,key=lambda x: (pair_counts[x],x))
             # 这里是 bytes 拼接：b' ' + b't' -> b' t'；若是 int 则变成 32+116=148
             new_token=best_pair[0]+best_pair[1]
             merges.append(best_pair)
             new_id=len(vocab)
             vocab[new_id]=new_token
 
-            # 错过：先写 word_freq={} 再 for word_freq.items()，
-            # 字典已空，更新循环不执行，下一轮 pairs 为空直接 break。
-            # 正确：用旧表生成新表，再整体替换。
-            # 错过：new_word_freq={} 普通 dict 上对不存在的键做 += 会 KeyError；
-            # 要用 Counter()，或 dict.get(key, 0) + freq。
-            new_word_freq=Counter()
-
-            for tokens,freq in word_freq.items():
+            # 错过：for tokens in pair_to_words[best_pair] 边遍历边 remove/add
+            # → RuntimeError: Set changed size during iteration
+            # 正确：先 list(...) 拷贝再遍历
+            affected=list(pair_to_words[best_pair])
+            # 错过（naive 版）：每轮扫全部 word_freq 重数 pairs + 重建全表 → ~3s，speed 测试要 <1.5s
+            # 正确：只处理 affected；减旧序列全部 pair，再加新序列全部 pair（乘 freq）
+            # 错过：word_freq=new_word_freq 且 new 只含 affected → 无关词全丢
+            # 错过：merge 用 for i in range(len-1) 只 append 左侧、忘 i+=2 → 长度/内容错
+            # 错过：pair_counts 只 -=1 而不是 -=freq；或只更新 best_pair 不更新邻接 pair
+            for tokens in affected:
+                freq=word_freq[tokens]
+                # 1) 减旧序列贡献的全部 pair（×freq），并从倒排里摘掉旧 word
+                for i in range(len(tokens)-1):
+                    p=(tokens[i],tokens[i+1])
+                    pair_counts[p]-=freq
+                    if pair_counts[p]<=0:
+                        del pair_counts[p]
+                    pair_to_words[p].discard(tokens)
+                # 2) while i 做不重叠 merge
                 new_tokens=[]
                 i=0
                 while i<len(tokens):
@@ -72,10 +89,17 @@ class BPE:
                     else:
                         new_tokens.append(tokens[i])
                         i+=1
-                # 错过：new_word_freq[key] = freq 会覆盖；
-                # 多个旧序列 merge 成同一 tuple 时应累加 +=
-                new_word_freq[tuple(new_tokens)]+=freq
-            word_freq=new_word_freq
+                new_tokens=tuple(new_tokens)
+                # 3) 加新序列贡献的全部 pair（×freq），倒排挂上新 word
+                for i in range(len(new_tokens)-1):
+                    p=(new_tokens[i],new_tokens[i+1])
+                    pair_counts[p]+=freq
+                    pair_to_words[p].add(new_tokens)
+                # 4) 更新 word_freq（可能多个旧 word 合成同一个 new）
+                word_freq[new_tokens]=word_freq.get(new_tokens,0)+freq
+                del word_freq[tokens]
+            # best_pair 本轮已合完，倒排清空（计数应已归零并被删）
+            pair_to_words[best_pair].clear()
 
         return vocab,merges
 
