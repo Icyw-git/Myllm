@@ -1,0 +1,4 @@
+run,n_logs,first_train,last_train,min_train,ok_near_zero,note
+overfit_002,51,9.287472,0.002048,0.002048,True,ok
+overfit_smoke,0,,,,False,missing_log
+overfit_001,0,,,,False,missing_log

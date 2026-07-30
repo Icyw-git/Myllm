@@ -1,0 +1,4 @@
+domain,bytes,chars,tokens,bytes_per_token,chars_per_token,runtime_s
+owt,5000000,4957429,1128966,4.4288,4.3911,1.803
+tinystories,5000000,4997978,1248763,4.004,4.0023,0.796
+zh,1132,402,962,1.1767,0.4179,0.016

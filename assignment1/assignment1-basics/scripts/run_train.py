@@ -222,15 +222,31 @@ def _swanlab_init(args: argparse.Namespace, n_params: int, device: str):
     os.environ["SWANLAB_EXP_NAME"] = exp_name
     import swanlab
 
-    tags = ["cs336", "overfit" if args.overfit else "tinystories"]
+    if args.overfit:
+        dataset_tag = "overfit"
+    else:
+        # 避免 OWT 跑被默认打成 tinystories；可用 SWANLAB_DATASET_TAG 覆盖
+        env_ds = (os.environ.get("SWANLAB_DATASET_TAG") or "").strip()
+        if env_ds:
+            dataset_tag = env_ds
+        else:
+            train_s = str(args.train_data).lower()
+            dataset_tag = "owt" if "owt" in train_s or "openwebtext" in train_s else "tinystories"
+    tags = ["cs336", dataset_tag]
     if os.environ.get("SWANLAB_TAGS"):
         tags.extend(t.strip() for t in os.environ["SWANLAB_TAGS"].split(",") if t.strip())
+    # 去重保序
+    tags = list(dict.fromkeys(tags))
+
+    group = (os.environ.get("SWANLAB_GROUP") or "").strip()
+    if not group:
+        group = "overfit" if args.overfit else "train"
 
     kwargs: dict = {
         "config": _swanlab_run_config(args, n_params, device),
         "logdir": str(args.out_dir / "swanlab"),
         "experiment_name": exp_name,
-        "group": "overfit" if args.overfit else "train",
+        "group": group,
         "job_type": "train",
         "tags": tags,
     }
@@ -248,7 +264,8 @@ def _swanlab_init(args: argparse.Namespace, n_params: int, device: str):
     run = swanlab.init(**kwargs)
     print(
         f"SwanLab: project={kwargs.get('project', '(env/default)')} "
-        f"exp={kwargs['experiment_name']} logdir={kwargs['logdir']}"
+        f"group={kwargs['group']} exp={kwargs['experiment_name']} "
+        f"logdir={kwargs['logdir']}"
     )
     return run
 
@@ -262,6 +279,7 @@ def _swanlab_log_row(row: dict, step: int) -> None:
         "train/lr": row["lr"],
         "train/ppl": math.exp(min(row["train_loss"], 20)),
         "time/wall_s": row["wall_s"],
+        "data/tokens_seen": row["tokens_seen"],
     }
     if "valid_loss" in row:
         payload["valid/loss"] = row["valid_loss"]
@@ -374,6 +392,7 @@ def main() -> None:
     log_path = args.out_dir / ("log_overfit.jsonl" if args.overfit else "log.jsonl")
     metrics = []
     t0 = time.time()
+    tokens_per_step = args.batch_size * args.context_length
     model.train()
     pbar = tqdm(range(start_step, args.steps), desc="train", unit="step")
     running = 0.0
@@ -413,6 +432,7 @@ def main() -> None:
                 "train_loss_avg": avg,
                 "lr": lr,
                 "wall_s": round(time.time() - t0, 2),
+                "tokens_seen": (step + 1) * tokens_per_step,
                 "overfit": args.overfit,
             }
             running = 0.0

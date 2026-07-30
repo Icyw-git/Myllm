@@ -1,0 +1,5 @@
+setting,variant,context_length,valid_loss,delta_vs_baseline
+train_eval_ctx256_ablation73,baseline,256,1.596534,0.0
+train_eval_ctx256_ablation73,no_rope,256,1.710289,0.113755
+train_eval_ctx512_q5,baseline,512,1.584255,0.0
+train_eval_ctx512_q5,no_rope,512,1.735129,0.150874

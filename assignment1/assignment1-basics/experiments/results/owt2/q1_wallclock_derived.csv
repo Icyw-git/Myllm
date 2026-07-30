@@ -1,0 +1,5 @@
+run,wall_s_cap,est_step,est_tokens_M,valid_at_cap,valid_at_20k,delta_20k_minus_cap,note
+owt_ba_20k,2700,22988,188.3,4.2484,4.2484,0.0000,45min可跑满20k(39min);derived from log.jsonl
+owt_lr6e4_20k,2700,22009,180.3,4.1825,4.1825,0.0000,45min可跑满20k;derived
+owt_bs64_20k,2700,11674,191.3,4.1076,3.9936,-0.1140,45min仅~11.7k step;同step最优够不着
+owt_bs64_lr6e4_20k,2700,11693,191.6,4.0663,3.9386,-0.1277,墙钟下仍优于ba但Δ缩小

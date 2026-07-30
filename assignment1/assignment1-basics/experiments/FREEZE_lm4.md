@@ -1,0 +1,26 @@
+## Freeze · 2026-07-29 · A1 lm4（用户选 1/2/3/5）
+
+- claim: warmup / lr×batch / 复合放大可口述；lm2 scaling 的 d_ff confound 可还债
+- hypothesis:
+  - Q1: warmup=0 终值≈ba ⇒ 本设定下非关键（early 或仍有差）
+  - Q2: 同 step 下 bs64+lr6e-4 有正交互；token 对齐后优势可能缩小
+  - Q3: 1.263 不能唯一分解；单轴 < 复合
+  - Q5: 按 8/3 d 对齐 d_ff 后，宽度 scaling 方向仍成立（或幅度变化）
+- discovery_refs: DISCOVERY_lm4 Q1,Q2,Q3,Q5
+- metric + direction: `valid_loss` 越低越好（通宵中不可改）
+- eval_command:
+  - Q1–Q3: `uv run --no-sync python experiments/eval_lm4_q123.py`
+  - Q5: 同 ba 协议 20k steps；对比 `d384_dff1024` / `d768_dff2048` vs 旧 `d384_20k`/`d768_20k`/`tinystories_ba`
+- data_version / split: TinyStories tokenized train/valid（与 ba 相同路径）
+- editable_scope: `scripts/run_train.py` 仅作启动；不改 `cs336_basics/`
+- forbidden_edits: eval 定义 / 数据划分 / metric
+- budget_wall_clock: Q1–Q3 ≤1h；Q5 通宵 2×20k（并行两卡）
+- wall_clock_per_trial: ~0.5–1h / 20k（视 GPU）
+- stop_condition: Q5 两跑 `ckpt_step20000` + log 末 valid；不改超参中途重开
+- expected_output_shape: `experiments/results/lm4/*.csv`
+- SwanLab（Q5）: project=`cs336-tinystories` group=`lm4-dff-align`
+  - exp=`d384_dff1024_20k` / `d768_dff2048_20k`
+  - tags=`lm4,dff-align,scaling`
+  - 指标键同前：`train/loss` `valid/loss` `train/lr` `time/wall_s` `data/tokens_seen`
+- Obsidian: off
+- planner: skipped（Q1–Q3 纯解析；Q5 旋钮已由 Discover 写死，不进 autoresearch 改代码环）

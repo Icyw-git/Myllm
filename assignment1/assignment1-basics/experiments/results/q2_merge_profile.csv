@@ -1,0 +1,4 @@
+bucket,n_steps,mean_s_per_merge,mean_affected,mean_freq,step_lo,step_hi
+early,3174,1.2187,8186.6,2.504e+06,1,3174
+mid,3174,0.0825,240.6,1.731e+04,15872,19045
+late,3174,0.0291,139.3,6.997e+03,28570,31743

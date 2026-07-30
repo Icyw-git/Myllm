@@ -1,0 +1,3 @@
+run,note,warmup,max_lr,final_valid,early_valid_mean,mid_valid_mean,late_valid_mean,early_train_mean,delta_vs_ba
+tinystories_ba,warmup=200,200,0.0003,1.481843,2.264416,1.559895,1.470887,3.44239,0.0
+warmu,warmup=0,0,0.0003,1.488795,2.275475,1.57111,1.478414,3.198982,0.006952

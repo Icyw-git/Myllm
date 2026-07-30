@@ -1,0 +1,4 @@
+run,note,weight_decay,rope_theta,valid_loss,delta_vs_ba
+tinystories_ba,baseline,0.1,10000.0,1.481843,0.0
+wd0_20k,weight_decay=0,0.0,10000.0,1.484798,0.002954
+rope500k_20k,rope_theta=5e5,0.1,500000.0,1.481076,-0.000767

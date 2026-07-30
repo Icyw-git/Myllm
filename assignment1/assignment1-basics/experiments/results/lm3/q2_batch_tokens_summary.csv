@@ -1,0 +1,4 @@
+run,batch_size,tokens_per_step,final_step,final_tokens,final_valid
+bs16_20k,16,4096,20000,81920000,1.567317
+tinystories_ba,32,8192,20000,163840000,1.481843
+bs64_20k,64,16384,20000,327680000,1.383309

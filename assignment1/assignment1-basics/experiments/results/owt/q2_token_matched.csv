@@ -1,0 +1,5 @@
+run,step,tokens_seen,valid_loss,delta_tokens,note
+owt_ba_20k,20000,163840000,4.248361,0,matched to owt_ba final tokens
+owt_lr6e4_20k,20000,163840000,4.182496,0,matched to owt_ba final tokens
+owt_bs64_20k,10000,163840000,4.168087,0,matched to owt_ba final tokens
+owt_bs64_lr6e4_20k,10000,163840000,4.121699,0,matched to owt_ba final tokens

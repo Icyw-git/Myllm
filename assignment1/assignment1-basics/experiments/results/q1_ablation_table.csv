@@ -1,0 +1,7 @@
+run,variant,max_lr,step,valid_loss,valid_ppl,train_loss,delta_vs_baseline
+baseline,baseline,0.0003,8000,1.596534,4.9359,1.526637,0.0
+silu_ffn,silu_ffn,0.0003,8000,1.690834,5.424,1.619953,0.0943
+post_norm,post_norm,0.0003,8000,1.69184,5.4295,1.615927,0.095306
+no_rope,no_rope,0.0003,8000,1.710289,5.5306,1.63455,0.113755
+no_rmsnorm_lr3e4,no_rmsnorm,0.0003,8000,2.073329,7.9513,2.001249,0.476795
+no_rmsnorm_lr1e4,no_rmsnorm,0.0001,8000,2.825326,16.8664,2.742248,1.228792

@@ -5,6 +5,9 @@
 用法：
   cd assignment1/assignment1-basics
   uv run python scripts/run_tokenize.py
+  # OWT（默认 vocab=openwebtext-v2；建议先 valid 再 train）
+  uv run python scripts/run_tokenize.py --corpus owt --splits valid
+  uv run python scripts/run_tokenize.py --corpus owt --splits train
 
 ---------------------------------------------------------------------------
 为什么作业里的 Tokenizer.encode 很慢？
@@ -48,13 +51,28 @@ from tqdm import tqdm
 
 from cs336_basics.get_tokenizer import Tokenizer
 
-DEFAULT_VOCAB_DIR = Path("/data1/wcz/projects/Myllm-runs/tokenizers/tinystories")
-DEFAULT_DATA_DIR = Path("/data1/wcz/datasets/myllm/tinystories")
 DEFAULT_OUT_DIR = Path("/data1/wcz/datasets/myllm/tokenized")
 
-SPLITS = {
-    "train": "TinyStoriesV2-GPT4-train.txt",
-    "valid": "TinyStoriesV2-GPT4-valid.txt",
+# corpus → 默认路径 + 输入文件名 + 输出前缀（可用 CLI 覆盖 vocab/data/out）
+CORPORA: dict[str, dict] = {
+    "tinystories": {
+        "vocab_dir": Path("/data1/wcz/projects/Myllm-runs/tokenizers/tinystories"),
+        "data_dir": Path("/data1/wcz/datasets/myllm/tinystories"),
+        "splits": {
+            "train": "TinyStoriesV2-GPT4-train.txt",
+            "valid": "TinyStoriesV2-GPT4-valid.txt",
+        },
+        "out_prefix": "tinystories",
+    },
+    "owt": {
+        "vocab_dir": Path("/data1/wcz/projects/Myllm-runs/tokenizers/openwebtext-v2"),
+        "data_dir": Path("/data1/wcz/datasets/myllm/openwebtext"),
+        "splits": {
+            "train": "owt_train.txt",
+            "valid": "owt_valid.txt",
+        },
+        "out_prefix": "owt",
+    },
 }
 
 GPT2_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -216,29 +234,51 @@ def tokenize_file(encoder: FastEncoder, input_path: Path, out_path: Path, chunk_
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Tokenize corpus to uint16 .npy (fast, with progress)")
-    p.add_argument("--vocab-dir", type=Path, default=DEFAULT_VOCAB_DIR)
-    p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    p.add_argument(
+        "--corpus",
+        choices=sorted(CORPORA.keys()),
+        default="tinystories",
+        help="语料预设：决定默认 vocab/data 路径、输入文件名、输出前缀",
+    )
+    p.add_argument("--vocab-dir", type=Path, default=None, help="覆盖 CORPORA[corpus].vocab_dir")
+    p.add_argument("--data-dir", type=Path, default=None, help="覆盖 CORPORA[corpus].data_dir")
     p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    p.add_argument("--splits", nargs="+", default=["train", "valid"], choices=list(SPLITS.keys()))
+    p.add_argument("--out-prefix", type=str, default=None, help="输出 {prefix}_{split}.npy；默认跟 corpus")
+    p.add_argument(
+        "--splits",
+        nargs="+",
+        default=["train", "valid"],
+        choices=["train", "valid"],
+    )
     p.add_argument("--chunk-tokens", type=int, default=1_000_000)
     p.add_argument("--special-token", default="<|endoftext|>")
     args = p.parse_args()
 
+    cfg = CORPORA[args.corpus]
+    splits_map: dict[str, str] = cfg["splits"]
+    if args.vocab_dir is None:
+        args.vocab_dir = cfg["vocab_dir"]
+    if args.data_dir is None:
+        args.data_dir = cfg["data_dir"]
+    out_prefix = args.out_prefix or cfg["out_prefix"]
+
+    print(f"corpus={args.corpus} vocab_dir={args.vocab_dir} data_dir={args.data_dir} out_prefix={out_prefix}")
     encoder = load_fast_encoder(args.vocab_dir, [args.special_token])
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_meta = {}
+    all_meta: dict = {"corpus": args.corpus, "out_prefix": out_prefix}
     t0 = time.time()
     for split in args.splits:
-        inp = args.data_dir / SPLITS[split]
+        inp = args.data_dir / splits_map[split]
         if not inp.is_file():
             raise SystemExit(f"missing: {inp}")
-        out = args.out_dir / f"tinystories_{split}.npy"
+        out = args.out_dir / f"{out_prefix}_{split}.npy"
         all_meta[split] = tokenize_file(encoder, inp, out, args.chunk_tokens)
 
     all_meta["total_seconds"] = round(time.time() - t0, 2)
     all_meta["vocab_dir"] = str(args.vocab_dir)
-    meta_path = args.out_dir / "tinystories_tokenize_meta.json"
+    all_meta["data_dir"] = str(args.data_dir)
+    meta_path = args.out_dir / f"{out_prefix}_tokenize_meta.json"
     with open(meta_path, "w") as f:
         json.dump(all_meta, f, indent=2)
     print(f"\nmeta -> {meta_path}")

@@ -1,0 +1,9 @@
+variant,context_length,valid_loss,valid_ppl,delta_vs_baseline,ckpt
+baseline,64,1.863363,6.4454,0.0,/data1/wcz/projects/Myllm-runs/experiments/ablation73/baseline/ckpt_step8000.pt
+baseline,128,1.685318,5.3942,0.0,/data1/wcz/projects/Myllm-runs/experiments/ablation73/baseline/ckpt_step8000.pt
+baseline,256,1.638106,5.1454,0.0,/data1/wcz/projects/Myllm-runs/experiments/ablation73/baseline/ckpt_step8000.pt
+baseline,512,2.064468,7.8811,0.0,/data1/wcz/projects/Myllm-runs/experiments/ablation73/baseline/ckpt_step8000.pt
+no_rope,64,1.968782,7.1619,0.105419,/data1/wcz/projects/Myllm-runs/experiments/ablation73/no_rope/ckpt_step8000.pt
+no_rope,128,1.793647,6.0113,0.108329,/data1/wcz/projects/Myllm-runs/experiments/ablation73/no_rope/ckpt_step8000.pt
+no_rope,256,1.745355,5.7279,0.107249,/data1/wcz/projects/Myllm-runs/experiments/ablation73/no_rope/ckpt_step8000.pt
+no_rope,512,1.952165,7.0439,-0.112302,/data1/wcz/projects/Myllm-runs/experiments/ablation73/no_rope/ckpt_step8000.pt

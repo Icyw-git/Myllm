@@ -1,0 +1,10 @@
+run,bucket,n,mean_valid_loss,step_lo,step_hi,first_valid_loss
+baseline,early,4,2.823715,200,800,3.570717
+baseline,mid,4,1.730529,4200,4800,1.759007
+baseline,late,4,1.61197,7400,8000,1.636867
+post_norm,early,4,2.915443,200,800,3.65633
+post_norm,mid,4,1.808639,4200,4800,1.837837
+post_norm,late,4,1.705058,7400,8000,1.728455
+no_rmsnorm_lr3e4,early,4,4.237017,200,800,5.633143
+no_rmsnorm_lr3e4,mid,4,2.273619,4200,4800,2.323524
+no_rmsnorm_lr3e4,late,4,2.087576,7400,8000,2.11733

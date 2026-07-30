@@ -1,0 +1,3 @@
+run,params,params_M,valid_loss,valid_ppl,delta_vs_baseline,params_delta
+baseline,22696448,22.6964,1.596534,4.9359,0.0,0
+silu_ffn,19943936,19.9439,1.690834,5.424,0.0943,-2752512

@@ -1,0 +1,12 @@
+run_id,git_commit,command,config,seed,dataset,metric,result,runtime_s,status,notes
+owt-bpe-train-v2,dff9a77,scripts/run_train_bpe.py --fast --vocab-size 32000,vocab=32000,NA,owt_train.txt,wall_clock_s,8700.3,8700.3,baseline,maps_to=context;merges=31743;out=openwebtext-v2
+q2-merge-profile,dff9a77,experiments/eval_q2_merge_profile.py,owt-bpe-train-v2.log,NA,train_log,mean_s_per_merge_early_mid_late,"1.22/0.083/0.029",1,done,maps_to=Q2;pearson_aff_s~0.89
+q1-compression,dff9a77,experiments/eval_q1_compression.py,--max-bytes 5000000,NA,owt+ts+zh,bytes_per_token,"owt=4.4288;ts=4.004;zh=1.1767",5.1,done,maps_to=Q1;higher=better_compression
+lm4_q123,,,eval_lm4_q123.py,0,tinystories,valid_loss,see results/lm4,0,done,maps_to=Q1,Q2,Q3
+d384_dff1024_20k,,,run_train d=384 d_ff=1024,0,tinystories,valid_loss,1.506,,done,maps_to=Q5;dff_align
+d768_dff2048_20k,,,run_train d=768 d_ff=2048,0,tinystories,valid_loss,1.379,,done,maps_to=Q5;dff_align
+owt_tokenize,dff9a77,scripts/run_tokenize.py --corpus owt,vocab=openwebtext-v2,NA,owt,uint16_npy,"train=2.727e9;valid=6.64e7",~3600,done,maps_to=Q0;blocking;tmux=owt-overnight
+owt_ba_20k,dff9a77,run_train ba protocol vocab=32k,L4/d512/bs32/lr3e-4/20k,0,owt,valid_loss,4.248361,2349.0,done,maps_to=Q1;swanlab=cs336-owt/owt-hparam;ppl=69.99
+owt_lr6e4_20k,dff9a77,run_train lr=6e-4,L4/d512/bs32/lr6e-4/20k,0,owt,valid_loss,4.182496,2453.5,done,maps_to=Q2;swanlab=cs336-owt/owt-hparam;ppl=65.53
+owt_bs64_20k,dff9a77,run_train bs=64,L4/d512/bs64/lr3e-4/20k,0,owt,valid_loss,3.993573,4625.4,done,maps_to=Q2;swanlab=cs336-owt/owt-hparam;ppl=54.25;tokens=2x
+owt_bs64_lr6e4_20k,dff9a77,run_train bs64+lr6e-4,L4/d512/bs64/lr6e-4/20k,0,owt,valid_loss,3.938637,4617.9,done,maps_to=Q2;swanlab=cs336-owt/owt-hparam;ppl=51.35;best

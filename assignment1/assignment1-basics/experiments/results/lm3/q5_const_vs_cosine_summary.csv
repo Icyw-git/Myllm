@@ -1,0 +1,3 @@
+run,schedule,final_valid,final_ppl,final_lr,delta_vs_ba,wall_s
+tinystories_ba,cosine,1.481843,4.4011,3.0000001699312058e-05,0.0,2818.52
+const_lr_3e4_20k,constant,1.502048,4.4909,0.0003,0.020204,1644.28
