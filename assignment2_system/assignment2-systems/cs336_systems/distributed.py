@@ -45,29 +45,51 @@ class DDP(nn.Module):
         self.module = module
         self.world_size = dist.get_world_size()
 
-        # TODO(you): keep a registry of in-flight all-reduce handles, e.g.
-        #   self._pending_handles: list[dist.Work] = []
-        #   self._bucket_to_handle: dict[nn.Parameter, dist.Work] = {}
+        # 记录"在途"的异步 all-reduce：(参数, 通信句柄) 对
+        self._pending: list[tuple[nn.Parameter, dist.Work]] = []
 
-        # 1. Broadcast all parameters (and buffers) from rank 0 so every
-        #    replica starts with the same weights.
-        #    e.g. for param in module.parameters(): dist.broadcast(param.data, src=0)
+        # 1. 构造时：把 rank0 的参数广播给所有卡，保证各副本起点相同
+        for param in self.module.parameters():
+            dist.broadcast(param.data, src=0)
 
-        # 2. For every leaf parameter with requires_grad=True, register a
-        #    post-accumulate-grad hook that starts an async all-reduce of
-        #    ``param.grad`` and records the returned handle.
-        #    NOTE: handle tied/shared parameters (same tensor used twice) to
-        #    avoid double-reducing; tie by ``param.data_ptr()``.
+        # 2. 给每个需要梯度的叶子参数注册钩子：梯度一累加完就异步 all-reduce
+        #    用 data_ptr() 去重，避免 tied weights（同一张量）被 reduce 两次
+        seen: set[int] = set()
+        for param in self.module.parameters():
+            if not param.requires_grad or param.data_ptr() in seen:
+                continue
+            seen.add(param.data_ptr())
+            param.register_post_accumulate_grad_hook(self._make_grad_hook(param))
+
+    def _make_grad_hook(self, param: nn.Parameter):
+        """返回一个钩子函数：在 param.grad 就绪时被自动调用，发起异步 all-reduce。
+
+        注意必须在闭包里先持有 param（钩子签名只收参数本身），
+        async_op=True 让通信在后台进行，backward 继续算其他层——这就是 overlap。
+        """
+
+        def hook(_: nn.Parameter) -> None:
+            if param.grad is None:
+                return
+            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
+            self._pending.append((param, handle))
+
+        return hook
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
 
     def finish_gradient_synchronization(self):
-        """Wait for all pending gradient all-reduces, then divide by world_size.
+        """等待所有在途 all-reduce 完成，再把梯度除以 world_size（求平均）。
 
-        Called by the training loop right after ``loss.backward()``.
+        在 loss.backward() 之后、optimizer.step() 之前被调用。
         """
-        raise NotImplementedError  # TODO(you): implement
+        for _, handle in self._pending:
+            handle.wait()
+        # wait 之后 all-reduce 才真正写完 param.grad，此时才能安全地做平均
+        for param, _ in self._pending:
+            param.grad /= self.world_size
+        self._pending.clear()
 
 
 # --------------------------------------------------------------------------- #
