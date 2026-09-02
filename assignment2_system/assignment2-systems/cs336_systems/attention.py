@@ -37,6 +37,8 @@ Reference for the exact math: https://arxiv.org/abs/2205.14135
 """
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 
 
@@ -171,13 +173,135 @@ class FlashAttentionTritonAutogradFunction(torch.autograd.Function):
     NOTE: requires a CUDA GPU; tests are skipped automatically otherwise.
     """
 
-    BLOCK_M = 128  # TODO(you): tune
-    BLOCK_N = 128  # TODO(you): tune
+    BLOCK_M = 64  # 每个 program 负责的 query 行数
+    BLOCK_N = 64  # 每次内层循环处理的 key 数
 
     @staticmethod
     def forward(ctx, q: Tensor, k: Tensor, v: Tensor, is_causal: bool) -> Tensor:
-        raise NotImplementedError  # TODO(you): implement
+        """Run the flash-attention forward pass with a single fused Triton kernel.
+
+        One program per (query-block, batch): loads its Q block once into
+        registers/SMEM, then streams over K/V blocks applying the online
+        softmax update, finally writing o and lse to global memory.
+        """
+        B, N_Q, D = q.shape
+        N_K = k.shape[-2]
+        assert q.is_cuda, "expect CUDA inputs"
+        assert q.dtype in (torch.float32, torch.bfloat16, torch.float16), (
+            f"unsupported dtype {q.dtype}: fp32 走 CUDA core(ieee), "
+            "bf16/fp16 走 tensor core")
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+
+        o = torch.empty_like(q)
+        lse = torch.empty(B, N_Q, device=q.device, dtype=torch.float32)
+
+        BLOCK_M = FlashAttentionTritonAutogradFunction.BLOCK_M
+        BLOCK_N = FlashAttentionTritonAutogradFunction.BLOCK_N
+        BLOCK_D = triton.next_power_of_2(D)
+        grid = (triton.cdiv(N_Q, BLOCK_M), B)
+
+        _flash_attn_fwd_kernel[grid](
+            q, k, v, o, lse,
+            N_Q, N_K, D, D ** -0.5,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            lse.stride(0), lse.stride(1),
+            IS_CAUSAL=is_causal,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+            num_warps=4,
+        )
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.is_causal = is_causal
+        return o
 
     @staticmethod
     def backward(ctx, do: Tensor) -> tuple[Tensor | None, ...]:
-        raise NotImplementedError  # TODO(you): implement
+        raise NotImplementedError  # TODO(you): implement (extra credit)
+
+
+@triton.jit
+def _flash_attn_fwd_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+    N_Q, N_K, D, scale,
+    stride_qb, stride_qn, stride_qd,
+    stride_kb, stride_kn, stride_kd,
+    stride_vb, stride_vn, stride_vd,
+    stride_ob, stride_on, stride_od,
+    stride_lseb, stride_lsen,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """FlashAttention-2 forward, Algorithm 1 (https://arxiv.org/abs/2205.14135).
+
+    grid = (ceil(N_Q / BLOCK_M), B)。每个 program：
+      1. 载入自己的 Q 块 (BLOCK_M, D)
+      2. 沿 K 维循环 KV 块，维护运行态 (m, l, acc)
+      3. 收尾：acc /= l，写回 o 和 lse = m + log(l)
+    """
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # 本 program 负责的 query 行
+    offs_d = tl.arange(0, BLOCK_D)
+    q_mask = offs_m < N_Q
+    d_mask = offs_d < D  # D 不是 2 的幂时保护（测试里 D=64=BLOCK_D，恒真）
+
+    base = pid_b * stride_qb
+    q = tl.load(
+        q_ptr + base + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+        mask=q_mask[:, None] & d_mask[None, :], other=0.0,
+    )  # (BLOCK_M, BLOCK_D)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)  # 运行 max
+    l_i = tl.zeros([BLOCK_M], tl.float32)                # 运行 softmax 分母
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)       # 运行输出（未归一化）
+
+    # causal 时，query 行 i 只需要 key 0..i，所以本 program 只需处理
+    # key < (pid_m+1)*BLOCK_M；后面的块整块都在"未来"，直接跳过
+    if IS_CAUSAL:
+        hi = tl.minimum(N_K, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_K
+
+    for n0 in range(0, hi, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < N_K
+
+        k = tl.load(
+            k_ptr + pid_b * stride_kb + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+            mask=kv_mask[:, None] & d_mask[None, :], other=0.0,
+        )  # (BLOCK_N, BLOCK_D)
+        # input_precision 只对 fp32 输入有意义: ieee=CUDA core, 默认 tf32=tensor core。
+        # bf16/fp16 输入时 tl.dot 恒走 tensor core、fp32 累加, 此参数被忽略。
+        s = tl.dot(q, tl.trans(k), input_precision="ieee") * scale  # (BLOCK_M, BLOCK_N)
+
+        # 掩码必须在 exp 之前做：padding 的 key (kv_mask=False) 其 k=0,
+        # 若不掩码会以 s=0 混进 softmax；causal 未来位置置 -inf, exp 后为 0
+        s = tl.where(kv_mask[None, :], s, float("-inf"))
+        if IS_CAUSAL:
+            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+
+        # online softmax 更新（见模块 docstring 的公式）
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))       # (BLOCK_M,)
+        alpha = tl.exp(m_i - m_new)                       # 旧累计值的缩放系数
+        p = tl.exp(s - m_new[:, None])                    # 本块未归一化概率
+        l_i = alpha * l_i + tl.sum(p, axis=1)
+        v = tl.load(
+            v_ptr + pid_b * stride_vb + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+            mask=kv_mask[:, None] & d_mask[None, :], other=0.0,
+        )
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
+        m_i = m_new
+
+    acc = acc / l_i[:, None]                              # 最终归一化
+    lse = m_i + tl.log(l_i)                               # (BLOCK_M,) 真 logsumexp
+
+    tl.store(
+        o_ptr + pid_b * stride_ob + offs_m[:, None] * stride_on + offs_d[None, :] * stride_od,
+        acc, mask=q_mask[:, None] & d_mask[None, :],
+    )
+    tl.store(lse_ptr + pid_b * stride_lseb + offs_m * stride_lsen, lse, mask=q_mask)
