@@ -311,6 +311,7 @@ $$\boxed{N_{FSDP} > 1 + \frac{B\,W}{C} \;\text{时瓶颈}（forward/backward 同
 | 8.6 决定性实验 | benchmark.py --mixed-precision --attention | small, b1 ctx8192 | forward | bf16（两边同标准） | naive vs flash-triton |
 | 8.7 batch 扫描 | benchmark.py | small, ctx512 | full | fp32 | batch ∈ {1, 2, 8, 16, 32} |
 | 8.8 DDP/FSDP profiling | exercises/ddp_fsdp_profile.py | small, b4 ctx512 | full step | fp32 | 2 进程 × {baseline, ddp, ddp-sharded, fsdp} |
+| 8.9 backward 三方对比 | exercises/bench_flash_bwd.py | 纯 attention, B=1, D=64 | fwd+bwd | fp32 | N ∈ {1024,4096,8192} × {非causal, causal} × {naive, 存P, flash-pytorch, flash-triton} |
 
 模型尺寸（与 benchmark.py MODEL_SIZES 一致）：small d768/L12 ≈ 128.6M；medium d1024/L24 ≈ 423M。
 
@@ -475,3 +476,57 @@ kernel 已支持 bf16/fp16 输入（tensor core + fp32 累加）; 两边都跑 -
    生产级三件套: NCCL/NVLink + flat buffer 合并 + overlap（DDP 钩子已 overlap 但被
    gloo 延迟淹没）
 3. 双进程 rank 间峰值完全一致（±0.01GB）→ broadcast/分片对称性正确
+
+### 8.9 backward 三方对比: naive vs 存P vs 重计算（exercises/bench_flash_bwd.py, 2026-09-03）
+
+**Triton backward 实现要点**（attention.py, extra credit 完成）:
+- 预处理 `delta = rowsum(dO⊙O)`（PyTorch 一行, (B,N), fp32）
+- **dQ kernel**: grid 按 Q 块分, 每个 program 独占一个 Q 块 → dq 直接 store, 零写冲突
+- **dK/dV kernel**: grid 按 K 块分、沿 Q 块循环（转置分工）→ dk/dv 直接 store, 零写冲突;
+  causal 时 Q 循环从对角块起点 `lo=(pid_n·BLOCK_N)//BLOCK_M·BLOCK_M` 开始
+- 坑: backward 循环内驻留 tile 比 forward 多（q/do 常驻 + trans 缓冲）,
+  BLOCK_N=64 + num_stages=2 仍要 112KB > 3090 的 99KB smem → **backward 用 BLOCK_N=32**
+- 算法: P 不存, backward 用 `P = exp(S − lse)` 逐块重建; softmax 反传
+  `dS = P ⊙ (dP − delta)`, `dQ = dS·K/√d`, `dK = dSᵀ·Q/√d`, `dV = Pᵀ·dO`
+
+**正确性**: max|grad diff| vs naive（B=1, N=256, D=64）——全部远小于 1e-2 容差:
+
+| 实现 | 非causal | causal |
+|---|---|---|
+| 存P（不重计算） | 1.79e-7 | 7.22e-7 |
+| flash-pytorch（重计算） | 2.38e-7 | 1.19e-6 |
+| flash-triton（重计算） | 5.36e-7 | 2.03e-6 |
+
+**fwd+bwd 性能/显存**（B=1, D=64, fp32, iters=5; FLOPs 记账: fwd 4N²·D, bwd 存P/naive 8N²·D, 重计算 10N²·D）:
+
+| 非causal | ms/step | 峰值MB | TFLOP/s | | causal | ms/step | 峰值MB |
+|---|---|---|---|---|---|---|---|
+| **N=1024** | | | | | | | |
+| naive | 0.6 | 33.8 | 1.25 | | naive | 0.8 | 34.8 |
+| 存P | 0.5 | 33.5 | 1.54 | | 存P | 0.6 | 33.5 |
+| flash-pytorch | 5.1 | 21.3 | 0.18 | | flash-pytorch | 6.0 | 21.3 |
+| flash-triton | 1.1 | 18.5 | 0.88 | | flash-triton | 1.2 | 18.5 |
+| **N=4096** | | | | | | | |
+| naive | 1.8 | 278.2 | 7.23 | | naive | 2.2 | 294.2 |
+| 存P | 1.6 | 277.3 | 8.11 | | 存P | 1.8 | 277.3 |
+| flash-pytorch | 25.8 | 36.3 | 0.58 | | flash-pytorch | 29.3 | 36.3 |
+| flash-triton | 6.0 | 25.3 | 2.50 | | flash-triton | 5.5 | 25.3 |
+| **N=8192** | | | | | | | |
+| naive | 6.8 | 1052.2 | 7.63 | | naive | 8.1 | 1116.2 |
+| 存P | 5.8 | 1050.3 | 8.86 | | 存P | 6.6 | 1050.3 |
+| flash-pytorch | 44.6 | 56.3 | 1.35 | | flash-pytorch | 50.3 | 56.4 |
+| flash-triton | 21.4 | 34.3 | 2.81 | | flash-triton | 15.8 | 34.3 |
+
+结论:
+1. **存P ≈ naive 显存（峰值 ≈ 4×N²）**: backward 里 p、dp、(dp−delta)、ds 四个 N²
+   矩阵同时存活（out-of-place 各留一个）→ "少存一个 N²"救不了显存,
+   **重计算（不存 P）才是 O(N) 的唯一路线**
+2. **重计算的账**: +2N²·D FLOPs（12→14, +16.7%）换 N=8192 时 **30× 显存**
+   （1050→34.3MB）; 速度慢 3.7× 是教学 kernel 效率问题（fp32-ieee 走 CUDA core、
+   BLOCK_N 被 smem 压到 32、delta+两个 kernel 未全融合）, 不是重计算本身的错——
+   生产级 FA2（bf16 tensor core + 调优）在长 ctx 下反超（衔接 §8.6 结论）
+3. **causal 只有 flash-triton 受益**: 21.4→15.8ms（dQ 的 hi 裁剪 + dK/dV 的 lo 裁剪
+   跳过约一半 KV 块）; naive/存P causal 反而更慢（N² 布尔掩码物化 + where）
+4. flash-pytorch 最慢（Python 循环, 每 N 块 5 个小 matmul 走 autograd 调度）,
+   flash-triton 融合版快它 2-4×——再次印证 §8.4 的"分块算法≠快, 融合才是"
+5. 显存比随 N 单调下降（54.8%→9.1%→3.3%）: 分子线性分母平方, 与 §8.2 forward 同律

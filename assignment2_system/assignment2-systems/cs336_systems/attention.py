@@ -218,7 +218,65 @@ class FlashAttentionTritonAutogradFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do: Tensor) -> tuple[Tensor | None, ...]:
-        raise NotImplementedError  # TODO(you): implement (extra credit)
+        """Triton backward: 拆成 dQ 与 dK/dV 两个 kernel（各自内部零写冲突）。
+
+        算法与 PyTorch 版完全相同（见 FlashAttentionPytorchAutogradFunction.backward）:
+        1. 预处理 delta = rowsum(dO ⊙ O)，(B, N_Q)，每行一个标量
+        2. dQ kernel: 每个 program 负责一个 Q 块, 沿 KV 循环, 用 lse 重算
+           P = exp(S - lse)，累积 dq —— dq 只被本 program 写, 直接 store
+        3. dK/dV kernel: 每个 program 负责一个 K 块, 沿 Q 循环, 累积 dk/dv
+           —— 若仍按 Q 块分 program, 多个 program 会写同一片 dk/dv（冲突）,
+           所以按 K 块分 grid, 转置一下循环方向即可零冲突
+        不存 N² 的 P, 用重算 S=QK^T（+2N²D FLOPs）换 O(N) 显存。
+        """
+        q, k, v, o, lse = ctx.saved_tensors
+        do = do.contiguous()
+        B, N_Q, D = q.shape
+        N_K = k.shape[-2]
+        assert do.shape == o.shape
+
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        # 预处理用 PyTorch 一行即可（N×D 逐行内积, 不是瓶颈）; fp32 保证精度
+        delta = (do.float() * o.float()).sum(-1)  # (B, N_Q)
+
+        BLOCK_M = FlashAttentionTritonAutogradFunction.BLOCK_M
+        # backward 循环内比 forward 多驻留 q/do 常驻 tile + trans 缓冲,
+        # KV 块用 32 才能塞进 3090 的 99KB smem（forward 用 64）
+        BLOCK_N = 32
+        BLOCK_D = triton.next_power_of_2(D)
+
+        _flash_attn_dq_kernel[(triton.cdiv(N_Q, BLOCK_M), B)](
+            q, k, v, do, lse, delta, dq,
+            N_Q, N_K, D, D ** -0.5,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            dq.stride(0), dq.stride(1), dq.stride(2),
+            lse.stride(0), lse.stride(1),
+            delta.stride(0), delta.stride(1),
+            IS_CAUSAL=ctx.is_causal,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+            num_warps=4, num_stages=2,  # 循环内驻留 k/v 两块 tile, 3 级流水会超 3090 的 99KB smem
+        )
+        _flash_attn_dkdv_kernel[(triton.cdiv(N_K, BLOCK_N), B)](
+            q, k, v, do, lse, delta, dk, dv,
+            N_Q, N_K, D, D ** -0.5,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2),
+            dv.stride(0), dv.stride(1), dv.stride(2),
+            lse.stride(0), lse.stride(1),
+            delta.stride(0), delta.stride(1),
+            IS_CAUSAL=ctx.is_causal,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+            num_warps=4, num_stages=2,
+        )
+        return dq, dk, dv, None
 
 
 @triton.jit
@@ -305,3 +363,149 @@ def _flash_attn_fwd_kernel(
         acc, mask=q_mask[:, None] & d_mask[None, :],
     )
     tl.store(lse_ptr + pid_b * stride_lseb + offs_m * stride_lsen, lse, mask=q_mask)
+
+
+@triton.jit
+def _flash_attn_dq_kernel(
+    q_ptr, k_ptr, v_ptr, do_ptr, lse_ptr, delta_ptr, dq_ptr,
+    N_Q, N_K, D, scale,
+    stride_qb, stride_qn, stride_qd,
+    stride_kb, stride_kn, stride_kd,
+    stride_vb, stride_vn, stride_vd,
+    stride_dob, stride_don, stride_dod,
+    stride_dqb, stride_dqn, stride_dqd,
+    stride_lseb, stride_lsen,
+    stride_deltab, stride_deltan,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """dQ kernel：grid = (ceil(N_Q/BLOCK_M), B)，与 forward kernel 同构。
+
+    每个 program 拥有一个 Q 块（独占 → dq 可直接 store, 无冲突）：
+      载入 Q 块与 dO 块 → 沿 KV 块循环：
+        S_j = Q·K_j^T * scale → 掩码 → P_j = exp(S_j - lse)（重算, 不用存 N²）
+        dP_j = dO·V_j^T, dS_j = P_j ⊙ (dP_j - delta)
+        dq += dS_j·K_j * scale
+    causal 裁剪与 forward 相同：query 行 i 只需要 key 0..i。
+    """
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    q_mask = offs_m < N_Q
+    d_mask = offs_d < D
+
+    base = pid_b * stride_qb
+    q = tl.load(q_ptr + base + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+                mask=q_mask[:, None] & d_mask[None, :], other=0.0)
+    do_ = tl.load(do_ptr + pid_b * stride_dob + offs_m[:, None] * stride_don + offs_d[None, :] * stride_dod,
+                  mask=q_mask[:, None] & d_mask[None, :], other=0.0)
+    lse = tl.load(lse_ptr + pid_b * stride_lseb + offs_m * stride_lsen, mask=q_mask, other=0.0)
+    delta = tl.load(delta_ptr + pid_b * stride_deltab + offs_m * stride_deltan, mask=q_mask, other=0.0)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+
+    if IS_CAUSAL:
+        hi = tl.minimum(N_K, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_K
+
+    for n0 in range(0, hi, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < N_K
+        k = tl.load(k_ptr + pid_b * stride_kb + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                    mask=kv_mask[:, None] & d_mask[None, :], other=0.0)
+        s = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
+        # 掩码必须在 exp 之前: padding key 与 causal 未来位置置 -inf → P=0
+        s = tl.where(kv_mask[None, :], s, float("-inf"))
+        if IS_CAUSAL:
+            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+        p = tl.exp(s - lse[:, None])                       # 重算 P_j, 只活在寄存器里
+        v = tl.load(v_ptr + pid_b * stride_vb + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                    mask=kv_mask[:, None] & d_mask[None, :], other=0.0)
+        dp = tl.dot(do_, tl.trans(v), input_precision="ieee")
+        ds = p * (dp - delta[:, None])                     # softmax 反传的 delta 技巧
+        acc += tl.dot(ds.to(q.dtype), k, input_precision="ieee")
+
+    acc *= scale
+    tl.store(dq_ptr + pid_b * stride_dqb + offs_m[:, None] * stride_dqn + offs_d[None, :] * stride_dqd,
+             acc, mask=q_mask[:, None] & d_mask[None, :])
+
+
+@triton.jit
+def _flash_attn_dkdv_kernel(
+    q_ptr, k_ptr, v_ptr, do_ptr, lse_ptr, delta_ptr, dk_ptr, dv_ptr,
+    N_Q, N_K, D, scale,
+    stride_qb, stride_qn, stride_qd,
+    stride_kb, stride_kn, stride_kd,
+    stride_vb, stride_vn, stride_vd,
+    stride_dob, stride_don, stride_dod,
+    stride_dkb, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvn, stride_dvd,
+    stride_lseb, stride_lsen,
+    stride_deltab, stride_deltan,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """dK/dV kernel：grid = (ceil(N_K/BLOCK_N), B)，循环方向转置。
+
+    每个 program 拥有一个 K 块（独占 → dk/dv 可直接 store, 无冲突），
+    沿 Q 块循环把"所有 query 行对该 key 块的贡献"累积完：
+        S = Q_i·K^T * scale → P = exp(S - lse) → dS = P ⊙ (dP - delta)
+        dk += dS^T·Q_i * scale,  dv += P^T·dO_i
+    causal 时 key j 只被 query i>=j 触碰 → Q 循环从 key 块所在 Q 块开始,
+    对角块内的越界由掩码兜底。越界的 padding query 行 s=-inf → P=0, 不污染累加。
+    """
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    kv_mask = offs_n < N_K
+    d_mask = offs_d < D
+
+    base = pid_b * stride_kb
+    k = tl.load(k_ptr + base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0.0)
+    v = tl.load(v_ptr + pid_b * stride_vb + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0.0)
+
+    dk_acc = tl.zeros([BLOCK_N, BLOCK_D], tl.float32)
+    dv_acc = tl.zeros([BLOCK_N, BLOCK_D], tl.float32)
+
+    if IS_CAUSAL:
+        lo = (pid_n * BLOCK_N) // BLOCK_M * BLOCK_M   # 对齐到 Q 块边界
+    else:
+        lo = 0
+
+    for m0 in range(lo, N_Q, BLOCK_M):
+        offs_m = m0 + tl.arange(0, BLOCK_M)
+        q_mask = offs_m < N_Q
+        q = tl.load(q_ptr + pid_b * stride_qb + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd,
+                    mask=q_mask[:, None] & d_mask[None, :], other=0.0)
+        do_ = tl.load(do_ptr + pid_b * stride_dob + offs_m[:, None] * stride_don + offs_d[None, :] * stride_dod,
+                      mask=q_mask[:, None] & d_mask[None, :], other=0.0)
+        lse = tl.load(lse_ptr + pid_b * stride_lseb + offs_m * stride_lsen, mask=q_mask, other=0.0)
+        delta = tl.load(delta_ptr + pid_b * stride_deltab + offs_m * stride_deltan, mask=q_mask, other=0.0)
+
+        s = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
+        # padding query 行必须置 -inf：其 q=0 → s=0, 否则 exp(0-lse)≠0 混进 dk/dv
+        s = tl.where(q_mask[:, None], s, float("-inf"))
+        if IS_CAUSAL:
+            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+        p = tl.exp(s - lse[:, None])
+        dp = tl.dot(do_, tl.trans(v), input_precision="ieee")
+        ds = p * (dp - delta[:, None])
+        dk_acc += tl.dot(tl.trans(ds).to(k.dtype), q, input_precision="ieee")
+        dv_acc += tl.dot(tl.trans(p).to(v.dtype), do_, input_precision="ieee")
+
+    dk_acc *= scale
+    tl.store(dk_ptr + pid_b * stride_dkb + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd,
+             dk_acc, mask=kv_mask[:, None] & d_mask[None, :])
+    tl.store(dv_ptr + pid_b * stride_dvb + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd,
+             dv_acc, mask=kv_mask[:, None] & d_mask[None, :])
