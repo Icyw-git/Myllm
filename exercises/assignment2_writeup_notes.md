@@ -722,3 +722,196 @@ allocator 峰值净增 = op 激活占用）。d=64 列（其余 d 几乎相同�
 3. 注意 compile 用时 ~40s（逐 shape 编译）, 推理/长训场景才划算;
    TF32 未开启（inductor 警告）—— 若允许 set_float32_matmul_precision('high'),
    GEMM 部分还能再快, 但精度语义变化需在 writeup 声明
+
+## 14. 计时规范矩阵（2.1.3b: warmup5 + measure10, fp32, b4 ctx512, 含 std）
+
+| size | mode | ms/step (std) | TFLOP/s | 峰值显存 |
+|---|---|---|---|---|
+| small | forward | 47.2 (±0.0) | 11.97 | 0.76GB |
+| small | forward-backward | 148.1 (±0.3) | 11.45 | 4.88GB |
+| small | full | 169.0 (±0.2) | 9.97 | 5.40GB |
+| medium | forward | 145.7 (±1.7) | 12.55 | 2.02GB |
+| medium | forward-backward | 439.4 (±1.1) | 12.51 | 13.04GB |
+| medium | full | 508.0 (±0.5) | 10.83 | 14.74GB |
+| large | forward | 298.4 (±1.7) | **13.94** | 4.40GB |
+| large | forward-backward | **OOM**（22.1GB 处 silu 分配失败） | - | - |
+| large | full | **OOM**（20.0GB 处 einsum 失败） | - | - |
+
+结论:
+1. std 0.0-1.7ms（<0.6%）—— warmup 后计时非常稳; 所有对比实验的均值差
+   都远大于 std, 结论可信
+2. TFLOP/s 随模型变大爬升（fwd: 11.97→12.55→13.94）—— 与 §8.7 batch 扫描
+   同一机理: 计算占比变大, launch 开销/小算子占比变小
+3. forward→forward-backward: 时间 ≈ ×3（bwd ≈ 2× fwd ✓ 理论）; 
+   fwd-bwd→full 只多 ~13%（optimizer step 被算力更强的部分掩盖）
+4. **large fwd-bwd 都装不下**: naive attention 的 N² 激活（每层 2×84MB 的 
+   S/P, 36 层 ≈ 6GB）+ SwiGLU 中间量把前向顶到 22GB。**换 flash 可解**
+   （S/P 消失, 预计 ~16GB）—— 下面的 bonus 实验验证
+5. CPU/GPU 时间差 < 0.12%: 两种钟测同一段墙钟（step 内含 sync）, 差异是
+   事件时间戳的 enqueue 延迟噪声, 无语义（见 2.1.3a 讨论）
+
+## 15. 无 warmup 对照 + 混合精度（2.1.3c / 2.1.5c）+ flash 救回 large
+
+**无 warmup 对照**（medium full fp32）:
+
+| 配置 | ms/step | std |
+|---|---|---|
+| warmup=5 | 508.0 | ±0.5ms |
+| warmup=0 | 535.1 | **±91.6ms（×183）** |
+
+无 warmup 时首步包含 cudnn 算法选择、allocator 首次 cudaMalloc、kernel 自动调优
+等一次性开销, 均值被拉高 5.3%、方差爆炸 → **计时必须 warmup**（2.1.3 的核心结论）。
+
+**混合精度 full step**（2.1.5c, b4 ctx512; large/xl 因 16B/参数硬地板在 24GB 不可行）:
+
+| size | fp32 ms / TF / GB | bf16 ms / TF / GB | 提速 | 显存 |
+|---|---|---|---|---|
+| small | 169.0 / 9.97 / 5.40 | 110.8 / 15.30 / 4.52 | **1.53×** | -0.9GB |
+| medium | 508.0 / 10.83 / 14.74 | 312.7 / 17.61 / 12.43 | **1.62×** | -2.3GB(-16%) |
+
+- 用加速比反解 GEMM 时间占比 θ（加速 = 1/(1−θ/2)）: small θ≈0.69, medium θ≈0.77
+  —— 模型越大 GEMM 占比越高, bf16 收益越大（与 §14 结论 2 一致）
+- est bytes/step 减半（5.48→2.74GB）→ AI 翻倍（310→619）, 但实测 TF 只 +53-63%:
+  bf16 GEMM 峰值（3090 tensor core fp32-accum ≈ 35.6 TF）与 fp32 CUDA core 相同,
+  收益来自**激活流量减半 + tensor core 对 GEMM 的执行效率**, 不是峰值翻倍
+- 显存: 激活减半, 但参数/梯度/AdamW 仍 fp32（-16% 而非 -50%）
+
+**bonus: flash 把 large fwd-bwd 从 OOM 救回**:
+
+| 实现 | 结果 |
+|---|---|
+| naive | OOM（前向 22.1GB 处 silu 分配失败） |
+| flash-triton | **19.95GB 可跑**: 868.9ms, 14.37 TF |
+
+"flash 的价值排序"最终版: ① 让装不下的配置可跑（large fwd-bwd, N=16384）
+② 长序列 bf16 提速 11×（§12）③ 短序列 fp32 略慢但可接受。
+
+## 16. memory_profiling（2.1.6; small 模型适配, b4, 10 步 full step fp32）
+
+**峰值表**（peak = 分配峰值, resident = 步后常驻[参数+优化器状态]）:
+
+| ctx | mode | dtype | peak MB | resident MB | 激活峰值 |
+|---|---|---|---|---|---|
+| 128 | forward | fp32 | 262 | 240 | 22MB |
+| 128 | forward | bf16 | 358 | 240 | 118MB |
+| 128 | full | fp32 | 1204 | 712 | 492MB |
+| 128 | full | bf16 | 1160 | 712 | 448MB |
+| 2048 | forward | fp32 | 2397 | 249 | 2148MB |
+| 2048 | forward | bf16 | 1967 | 249 | 1718MB |
+| 2048 | full | fp32 | 20847 | 713 | **20134MB** |
+| 2048 | full | bf16 | 15939 | 712 | 15227MB |
+
+(b) fwd vs full 之差 = 为 backward 保留的激活:
+- 激活 = 线性项（B·s·d 量级, 随 ctx 线性: 残差/SwiGLU/ln 保存量）
+  + **attention 平方项**（S+P = 2·B·h·s²·4B/层）
+- 分解验证: ctx128 激活 492MB（其中 s² 项 2·4·8·128²·4B·12层 ≈ 50MB, 线性 ≈ 442MB）
+  → ctx2048: 442×16 + 2·4·8·2048²·4B·12层(12.9GB) ≈ 7.1+12.9 = 20.0GB ✓ 实测 20.1GB
+- **ctx×16 激活 ×41 倍**——平方项主导, naive attention 的 O(s²) 激活是长上下文
+  显存爆炸的元凶（flash 直接消灭该项）
+
+(c) 混合精度: ctx2048 full 省 4.9GB(-24%): 激活/S/P 减半, 但参数/梯度/AdamW
+仍 fp32; fwd-only bf16 只省 20%（logits fp32 + autocast 缓存 + RMSNorm fp32 上转
+使实际省不到一半）
+
+(d) 激活张量大小推导: 单个残差张量 = B·s·d·4B（ctx2048: 16.8MB）;
+每层保存 ≈ 30 个残差单位（§9.2 的 c）: S/P 各 537MB(64 单位) + SwiGLU 3×67MB
++ q/k/v/o/ln 等 → 1.68GB/层 × 12 = 20GB ✓
+
+(e) 最大分配块: top 全是 ~20MB（= embedding/lm_head 权重 10000×512×4B = 20.5MB
+及其梯度/动量）——**没有巨型单块**, 显存由数万个小激活块构成（这也是
+expandable_segments 这类防碎片配置存在的原因）
+
+(f) Nsight/NVTX 残差统计: 见 nsys 小节（依赖环境）
+
+(a) Active memory timeline 截图: 上传 /tmp/mem_ctx128.pkl 与 /tmp/mem_ctx2048.pkl
+到 https://pytorch.org/memory_viz 生成（手动步骤）
+
+## 17. Nsight Systems 分析（2.1.4; small full step fp32 b4 ctx512, 8 步）
+
+工具链: benchmark.py 已加 NVTX 标注(benchmark_step 区间) → nsys profile
+(-t cuda,nvtx) → export sqlite → nsys_analyze.py（ns 单位坑 + shortName 需
+JOIN StringIds）。
+
+**(a) kernel 覆盖率**: 每个 step 的墙钟里 96.5% 至少有一个 kernel 在跑
+（8 步范围 96.3-96.6%, 极稳）—— **空闲只有 3.5%**
+
+**(d) 单步构成**: 墙钟 171.6ms, kernel 总时长 165.6ms; 29242 kernel / 8 步
+≈ 3657 个 kernel/步, 平均单个仅 ~45µs
+
+**(b) 最长无缝 kernel 链**: 仅 1.62ms（占 step 的 0.9%）—— 没有任何长连续
+计算段, 全是短 kernel 无缝接力
+
+**top kernel 累计**（8 步合计 ≈1323ms）:
+| kernel | 累计 | 占比 | 归类 |
+|---|---|---|---|
+| vectorized_elementwise | 431.7ms | 33% | 逐元素（silu/残差/掩码/RoPE…） |
+| Kernel2 (cuBLAS 内部) | 196.8ms | 15% | GEMM 变体 |
+| ampere_sgemm ×5 种 | 488.3ms | 37% | GEMM |
+| elementwise | 160.1ms | 12% | 逐元素 |
+| reduce_kernel | 35.7ms | 3% | 归约 |
+
+**核心解读（回答 8.3 的 gap 之谜）**: GPU 96.5% 时间"在忙", 但忙的一半是
+逐元素小算子（45%, FLOP/Byte ≈ 0.25, 远低于 ridge 38）—— **瓶颈不是 GPU
+空闲, 而是 GPU 在跑算力效率极低的 kernel**。这一个视角统一解释了:
+- torch.compile +26%（融合 elementwise, §11/§13）
+- model size / batch 变大 TFLOP/s 爬升（GEMM 占比升高, §14）
+- naive attention 慢在 softmax/mask 链（elementwise）而非矩阵乘
+
+(c) compile attention 的 kernel 对比 + (e) batch 1 vs 8 对比: 见下一节
+
+## 18. Nsight 对照实验（2.1.4c/e）
+
+**(c) attention N=4096 B=8 fp32, naive vs compile（23 次 fwd + 23 次 bwd 的 kernel 累计）**:
+
+| 指标 | naive | compile |
+|---|---|---|
+| fwd ms/次 | 9.19 | **4.31（2.1×）** |
+| kernel 总数 | 861 | 1310（更多!） |
+| eager elementwise 累计 | 588.7ms（65%） | **7.6ms（~0%）** |
+| triton fused softmax 链 | - | 347.1ms |
+| GEMM 累计 | 280.6ms | 273.5ms（不变, GEMM 无法再融合） |
+| mem_MB/次 | 2048.4 | 1032.5（减半） |
+
+解读: compile 的本质不是"kernel 变少"（反而多了）, 而是**把 softmax/mask 的
+逐元素链（5 次全量 N² 读写）融成 4 个 triton kernel（2 次读写）**——
+省的是显存流量, 与 §11 的显存减半一致。GEMM 时间纹丝不动（280.6→273.5ms）,
+因为 GEMM 本来就是单一算子无可融合; **提速上限 = 消灭 elementwise**:
+9.19 - (588.7-347)/23 ≈ 4.4ms ≈ 实测 4.31ms ✓ 定量吻合
+
+**(e) batch 1 vs 8（small full step fp32）**:
+
+| 指标 | b=1 | b=8 |
+|---|---|---|
+| 墙钟/步 | 110.0ms | 303.0ms |
+| **kernel 覆盖率** | **57.4%（空闲 42.6%!）** | **97.9%（空闲 2.1%）** |
+| kernel 数/步 | ~3680 | ~3660（几乎相同） |
+| 平均单 kernel | ~17µs | ~81µs |
+| TFLOP/s | 3.87 | 11.18 |
+
+解读: kernel 数量与 batch 无关 → b=1 时每个 kernel 只有 1/8 的工作量,
+但 launch 间隔/调度开销不变 → **GPU 42.6% 时间在等活干**（launch-bound）。
+这解释了 §8.7 batch 扫描 TFLOP/s 爬升和 §14 的 size 爬升: 都是"同样的
+kernel 数, 更多的每-kernel 功作量"。
+
+## 19. all-reduce 通信 benchmark（gloo 单机多进程模拟）
+
+**原始数据**（20 次均值±std, bus_GB/s = 2(n-1)/n × alg）:
+
+| world | 1MB ms (bus GB/s) | 10MB | 100MB | 1000MB |
+|---|---|---|---|---|
+| 2 | 1.30 (0.75) | 8.95 (1.09) | 82.0 (1.19) | 817.9 (1.19) |
+| 4 | 2.29 (0.64) | 13.4 (1.09) | 154.3 (0.95) | 1274.7 (1.15) |
+| 6 | 3.04 (0.54) | 17.4 (0.94) | 196.6 (0.83) | 1905.4 (0.85) |
+
+**结论**:
+1. **大消息带宽受限**: t ∝ S ✓（w2: 10→100→1000MB 时间精确 ×10/×10）,
+   饱和带宽 ≈ 1.19 GB/s
+2. **小消息延迟受限**: 1MB 时 alg GB/s 掉到 0.32-0.75——延迟项 2(n-1)·α 主导,
+   且随 world 线性增长（1.30→2.29→3.04ms ✓）。
+   **这正是 DDP 里 gradient bucket 存在的原因**（把小梯度聚成桶摊薄延迟）
+3. ring 的"总线带宽与卡数无关"预言: NCCL 下成立; gloo 下 w4/w6 略降
+   （0.85-1.15）——每 rank 的 CPU 转发与主机内存竞争有额外开销, 部分成立
+4. **绝对值局限**: gloo CUDA 路径 = GPU→CPU→共享内存 ring→CPU→GPU,
+   实测 1.2 GB/s 远低于真 NCCL（PCIe P2P ~16GB/s, NVLink 更高）。
+   但**流量公式 2(n-1)/n·S、延迟结构、bucket 动机**全部得到验证——
+   定性结论可迁移, writeup 声明即可

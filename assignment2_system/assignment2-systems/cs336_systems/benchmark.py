@@ -132,6 +132,13 @@ def time_steps(
            if mixed_precision and use_cuda else nullcontext())
 
     def step():
+        torch.cuda.nvtx.range_push('benchmark_step')
+        try:
+            _step_body()
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+    def _step_body():
         with ctx:
             if mode == 'forward':
                 with torch.no_grad():
