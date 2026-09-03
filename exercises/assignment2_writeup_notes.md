@@ -1,10 +1,119 @@
 # Assignment2 学习笔记：通信量与显存核算
 
-> 综合：自己的推导 + 元宝的 ring all-reduce 图解与 ZeRO 论文考据 + 代码实测复核。
+> 综合：公式推导、ring all-reduce / ZeRO 论文核对，以及代码实测复核。
 > 对应 writeup 题目：`alternate_ring_all_reduce`、`data_parallel_calcs`、`fsdp_calcs`、
 > `optimizer_state_sharding_accounting(c)`、`fsdp_accounting(a)`。
 >
 > ⚠️ 标注【自己推】的小节建议先遮住答案自己推一遍再看。
+
+## 先看结论
+
+这份笔记同时承担“推导草稿”和“实验日志”两个用途，所以细节较多。写正式 writeup 时建议每道题只保留三层：
+
+1. **答案框**：先给最终公式或 1～2 句结论。
+2. **一行理由**：说明通信对象/矩阵形状/显存组成。
+3. **证据**：只放最能区分假设的表格或截图；脚本细节放附录。
+
+本文后半的 RTX 3090 数据是实验日志，不必全部复制进 writeup。最重要的证据链是：`N²` attention 显存 → FlashAttention 的 `O(N)` 显存；Python 分块不等于快 → Triton 融合后长上下文反超；DDP/FSDP 的理论节省 → 临时 gather buffer 和 gloo 延迟会稀释实测收益。
+
+## 术语速查：术语后面必须跟“它为什么重要”
+
+| 术语 | 白话解释 | 在本实验中的作用 |
+|---|---|---|
+| **kernel** | GPU 执行的一小段函数；一次矩阵乘、softmax 或逐元素运算通常对应一个或多个 kernel | kernel 越碎，启动和调度的固定成本越明显 |
+| **kernel launch** | CPU 把一个 kernel 排入 GPU 队列的动作 | Python 分块会产生很多 launch，解释 flash-pytorch 为什么慢 |
+| **HBM / 显存带宽** | GPU 的大容量显存及其每秒搬运数据的速度 | attention 反复读写 `N×N` 矩阵时，带宽而不是乘法次数可能成为瓶颈 |
+| **片上存储（SRAM/register）** | GPU 内部、容量较小但速度很快的存储 | FlashAttention 把 tile 留在这里，避免把完整 score 写到 HBM |
+| **Tensor Core** | GPU 中专门做低精度矩阵乘的硬件单元 | FP16/BF16 矩阵乘更快，但需要接受精度变化 |
+| **autocast** | PyTorch 根据算子自动选择 FP16/BF16 或 FP32 的上下文 | 说明为什么模型参数仍可为 FP32，而部分计算使用低精度 |
+| **residual / activation** | forward 中间产生、backward 还要用的张量 | checkpoint 通过不保存它们来降低峰值显存 |
+| **FLOPs** | 浮点加法/乘法的次数；TFLOP/s 是每秒万亿次 | 衡量计算工作量，不等于真实运行时间 |
+| **计算强度（arithmetic intensity）** | FLOPs 除以搬运的字节数，单位 FLOP/Byte | 判断程序更接近“算力受限”还是“带宽受限” |
+| **roofline / ridge point** | 用算力峰值和带宽画出的上限模型；ridge point 是两种限制的交界 | AI 高于 ridge point 只表示理论上偏算力受限，不能保证实现达到峰值 |
+| **all-reduce** | 每个 rank 提供一份张量，最后每个 rank 都得到总和/平均值 | DDP 用它同步各卡的梯度 |
+| **all-gather** | 每个 rank 提供一片数据，最后每个 rank 都拿到完整数据 | FSDP 在使用分片权重前需要它 |
+| **reduce-scatter** | 先把各 rank 的数据相加，再把结果切片分给各 rank | FSDP 只保留本 rank 的梯度片，节省显存 |
+| **overlap** | 通信和计算在时间线上同时进行 | DDP/FSDP 只有真正重叠，通信时间才可能被隐藏 |
+| **gloo / NCCL** | PyTorch 的分布式通信后端；gloo 常用于 CPU，NCCL 面向 NVIDIA GPU | 本笔记的 gloo 双进程结果是保守上界，不能直接当作 NVLink 性能 |
+| **occupancy** | 一个 SM 同时容纳多少并行线程/程序的程度 | tile 太大或共享内存太多会降低 occupancy，导致 Triton 变慢 |
+
+写解释时采用固定句式：**“术语是什么 → 它改变了哪一项 → 表中哪个数字证明了这一点。”** 例如：“HBM 是 GPU 的大显存；朴素 attention 把 `N×N` score 写入 HBM，所以 N 翻倍时流量近似变四倍，表中 8192→16384 的显存正好体现了这一点。”
+
+## 实验结果怎么读（白话版）
+
+下面这段是所有实验的统一解释模板。正式 writeup 不要只写“快了 1.7 倍”或“显存少了 10 倍”，还要说明速度/显存变化究竟由哪一部分造成。
+
+### A. `tl.dot` 精度实验：更快是因为计算方式变了
+
+**预测。** FP32 的普通矩阵乘应该最准确但较慢；TF32、FP16、BF16 会把输入换成较短的数字格式，因此吞吐更高，但误差更大。BF16 的有效数字位比 FP16 少，所以同样的输入下它的误差通常最大。这里的“吞吐”就是一秒钟完成多少次乘加，不是模型最终训练速度。
+
+**结果。** micro-benchmark 中 FP32-ieee 约 16.2 TFLOP/s，TF32/FP16/BF16 约 25～26 TFLOP/s；cuBLAS FP16 可到 61.6 TFLOP/s。误差排序大致为 FP32 < FP16/TF32 < BF16。
+
+**解释。** 手写 Triton kernel 没有充分利用大矩阵的加载和并行能力，所以它只能达到硬件峰值的一部分；cuBLAS 是高度优化的库，能把数据更好地送入专门的矩阵计算单元。这个实验只说明“低精度矩阵乘有潜力更快”，不能直接推断整套 Transformer 也会按同样倍数加速，因为 Transformer 还有归一化、softmax、embedding 等操作。
+
+### B. 朴素 attention 与 FlashAttention：先看显存，再看速度
+
+**预测。** attention 的分数矩阵有 `N×N` 个元素，序列长度翻倍时显存应该接近变成 4 倍。FlashAttention 不把完整分数矩阵写入显存，只在小块内计算，因此显存应该随 `N` 近似线性增长。
+
+**结果。** N=16,384 时，朴素 FP32 attention 约 2,151.7 MB，FlashAttention 约 4.3 MB，比例约 0.2%。朴素实现严格呈平方增长，FlashAttention 呈线性增长。
+
+**解释。** 朴素实现不只是保存一个分数矩阵：softmax 输出和反向所需的临时结果也可能同时存在，所以实际峰值约为多个 `N²` 缓冲区之和。FlashAttention 只保留 Q、K、V、输出和每行一个 log-sum-exp 值，因此把最危险的 `N²` 项删掉了。这个结果首先证明的是“能不能跑更长序列”，其次才是“跑得快不快”。
+
+### C. 为什么 flash-pytorch 可能比朴素实现慢
+
+**预测。** 分块算法减少了大矩阵的存储，但如果每个小块都由 Python 循环调度，kernel 会被切得很碎；短序列上朴素实现反而可能更快。
+
+**结果。** context=2048 的 full step 中，朴素实现约 263 ms，flash-pytorch 约 323 ms；context=512 时两者基本持平。
+
+**解释。** 这里没有违反 FlashAttention 的理论，慢的是实现方式：12 层 × 多个 tile 会产生大量小操作，CPU 需要反复发出指令，GPU 也难以保持满负载。也就是说，“不保存 `N²` 矩阵”是内存策略，“融合成少数几个 GPU kernel”才是速度策略。两者必须同时做到，才能看到完整收益。
+
+### D. Triton FlashAttention 的长上下文结果
+
+**预测。** 短 context 时 attention 只占整步的一小部分，替换 attention 不会明显改变总时间；context 变长后，朴素实现的平方级读写会越来越重，Triton 版本应该逐渐反超。
+
+**结果。** small、batch=1、context=8192、BF16 forward 中，朴素实现 672.1 ms、10.64 GB；Triton FlashAttention 169.0 ms、1.04 GB，约 4 倍加速、10 倍省显存。context=2048 FP32 时两者约 82.0/86.6 ms，但 FlashAttention 显存少约 54%。
+
+**解释。** context=2048 时，FFN 和投影矩阵乘仍然占总时间的大头，attention 即使完全变快，也只能影响总时间的一部分；context=8192 时，attention 分数矩阵的读写已经成为主要负担，FlashAttention 同时得到“少写显存”和“融合操作”两个收益。BF16 还让 Triton 的矩阵乘进入专门的低精度计算单元，所以速度差距进一步放大。
+
+### E. `torch.compile`：减少小操作，但不会改变平方增长
+
+**预测。** 编译器可以把连续的小操作合并，减少每个操作单独启动 GPU kernel 的开销；但如果算法仍然生成 `N×N` 矩阵，显存的平方增长不会消失。
+
+**结果。** attention 网格中，编译后速度提高约 1.7～2.1 倍，显存约减半；整模型 small full step 从 170.9 ms 降到 134.8 ms，medium 从 508.9 ms 降到 417.3 ms。
+
+**解释。** 编译器把 softmax 链、RMSNorm、SwiGLU、残差相加等小操作合并了，所以少了很多“启动一次、读一次、写一次”的重复开销。它只是减少常数，不能把 `O(N²)` 变成 `O(N)`；因此 context=16,384 仍可能 OOM。当前自定义 flash Function 中带有动态 Python 循环，编译器无法稳定追踪，所以不能简单地把“Python 分块 flash”再套一层 compile。
+
+### F. backward 重计算：用时间换显存
+
+**预测。** 保存 `P` 会让反向过程继续持有多个 `N×N` 矩阵；不保存 `P`、反向时重新算它，应该显著降低显存，但会增加矩阵乘次数。
+
+**结果。** N=8192 时，存 P 的方案约 1050 MB，FlashAttention 重计算约 34 MB，约 30 倍省显存；教学版 FP32 Triton backward 约慢 3.7 倍。梯度最大误差约 `10^-6`，明显小于测试容差 `1e-2`。
+
+**解释。** 重计算增加的只是 `S=QK^T` 和 softmax 概率的计算，不会改变最终梯度公式；它把“存大矩阵”换成“再做一次矩阵乘”。教学 kernel 较慢主要是 FP32-ieee、较小 tile 和 dQ/dK/dV 分开的 kernel，不代表生产级 FlashAttention 的最终速度。causal 模式下 Triton 更快，是因为它跳过了确定不会用到的未来 tile；朴素实现仍可能先生成完整 mask，因而得不到同等收益。
+
+### G. batch 扫描：小 batch 先被固定开销拖住
+
+**预测。** batch 增大后，同一次 forward 处理的 token 更多，固定的 kernel 启动和调度时间被摊薄，GPU 利用率提高；但激活显存也会随 token 数增加，最终 OOM。
+
+**结果。** batch=1 到 16 时，small full FP32 的吞吐从 4.99 提升到 12.06 TFLOP/s；batch=32 在朴素 attention 下 OOM。
+
+**解释。** batch=1 时，GPU 还没来得及“吃饱”就已经做完了许多小操作；batch 增大后，大矩阵更适合并行计算，吞吐上升。继续增大 batch 并不会无限变快，因为显存和带宽会先达到上限。batch=32 的 OOM 是 attention 的 `N²` 激活与参数、梯度、AdamW 状态叠加的结果，换成 FlashAttention 可以直接减少其中最大的那一项。
+
+### H. checkpoint 段大小：理论最优要结合实际 residual 大小
+
+**预测。** 单层 checkpoint 的峰值是边界数量 `N/k` 加上重算段临时激活 `c·k`，因此一般呈 U 形；但如果每个 block 的 `c` 很大，最优点会落在最小合法 `k`。
+
+**结果。** medium full、context=2048、朴素 attention 中，k=1/2/4 的峰值约 13.1/16.1/22.0 GB；k=8 OOM。FlashAttention 将 k=1 峰值降到约 8.0 GB，但最优仍是 k=1。
+
+**解释。** 公式中的 `c` 不是抽象常数：朴素 attention 的每个 block 还带着很大的 score 和 softmax residual，实际 `c` 远大于 `N`，所以 `k^*=sqrt(N/c)<1`，只能选 k=1。FlashAttention 砍掉了 attention 的 `N²` residual，但 SwiGLU、归一化和其他中间值仍然很大，`c` 仍可能大于 `N`。因此 checkpoint 与 FlashAttention 是互补优化：前者减少同时保存的 block 数，后者减少每个 block 的内部残差。
+
+### I. DDP/FSDP profiling：理论节省不等于立刻变快
+
+**预测。** DDP 会增加梯度通信；把很多小梯度合并或在 backward 中提前通信，应该减少等待。FSDP 会减少常驻参数，但每层要 all-gather 权重，若实现中临时保存完整 buffer，实测节省会变小。
+
+**结果。** 双进程 gloo 模拟中，baseline/DDP/DDP-sharded/FSDP 每步约 342/702/1937/2838 ms，峰值显存约 5.39/5.39/5.17/5.02 GB。
+
+**解释与限制。** 这个排序说明当前实现中通信次数和单次通信延迟很重要，不能把它当作 NVLink/NCCL 的绝对成绩：两个进程共享一张 GPU，gloo 还经过主机转发，通信代价被严重放大。显存只下降少量，是因为 step 中仍短暂存在完整参数、gather list 或完整梯度；真正的 FSDP 需要逐层 gather、计算后立即释放，并用 reduce-scatter 保持梯度分片。这个实验更适合验证实现是否遵守生命周期，而不是比较生产集群速度。
 
 ---
 
@@ -546,19 +655,20 @@ kernel 已支持 bf16/fp16 输入（tensor core + fp32 累加）; 两边都跑 -
 |---|---|---|
 | 不 checkpoint | N | 1 |
 | 单层分段（每段 k 块） | N/k + c·k | 2 |
-| 递归嵌套（每层分 b 份） | b·log_b N = O(log N) | log_b N + 1 |
+| 递归嵌套（每层分 b 份） | (b−1)·log_b N + c = O(log N) | 约 log_b N + 1 |
 
 - 单层分段: 峰值(k) = N/k + c·k → 极值 **k* = √(N/c)**, 峰值 = 2√(cN)
   （两边各贡献一半: 边界 checkpoint 的 N/k 与重算段的 c·k 相等时最优）
-- 递归嵌套: 峰值满足 f(N) = b + f(N/b), f(1)=1 → f(N) = b·log_b N;
-  对 b 求导最优 **b = e ≈ 3**, 峰值 ≈ 3·log₃N = O(log N),
-  代价是每个 block 的 forward 跑 O(log N) 遍
-- 代码草图: 递归函数把当前段分 3 份, 存 3 个子段输入 checkpoint, backward 时递归重算
+- 递归嵌套: 当前层第 0 段输入已由上层保存，新增边界只有 `b−1` 个，因此
+  `f(N)=(b−1)+f(N/b)`，`f(1)=c`，解为
+  `f(N)=(b−1)log_b N+c`。连续分析 `((b−1)/ln b)` 对 `b>1` 单调递增，
+  所以允许的整数分支中最优是 **b=2**，不是 `b≈e`；代价是 block 可能被多层重算。
+- 代码草图: 递归函数把当前段二分，保存后半段输入 checkpoint，backward 时递归重算。
 
 (b) 是 (a) 的受限版: 只许重算一遍（不许嵌套）→ 在单层分段里找最优 k,
 用 k* = √(N/c) 与实验对照。
 
-### 9.2 (b) xl b4 s2048 的最优段大小（exercises/bench_checkpointing.py, 待跑）
+### 9.2 (b) checkpoint 段大小实验（exercises/bench_checkpointing.py）
 
 3090 适配声明: xl full step 固定开销 16B/参数 × 3.41B ≈ 54.6GB > 24GB;
 large 也实测全 k OOM（固定 21.5GB + 最少激活即超限）→ checkpointing 只省激活、
@@ -631,7 +741,8 @@ scores 2.1GB + softmax 2.1GB 等, **任何 checkpoint 粒度都压不掉**)
 (注: 脚本"激活MB(估)"列按 full step 的 U 型公式估算, 对 fwd-only 模式不适用,
 以上表实测值为准。)
 
-待填: flash 对照表（medium full step + flash-pytorch, 预测 k=0 可跑、谷底右移到 k=2）。
+> [!note] 尚未完成的对照
+> medium full step + flash-pytorch 的 `k=0` 基线和“谷底是否右移到 `k=2`”尚未实测；不要把这里的预测写成最终结论。
 
 ## 10. 官方 attention 网格（4.1.1: naive vs flash, B=8, fp32, 100 次计时）
 
