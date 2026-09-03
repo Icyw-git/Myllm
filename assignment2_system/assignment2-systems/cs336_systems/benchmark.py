@@ -196,6 +196,7 @@ def report(
 
     print(f'model={args.model_size} mode={args.mode} device={device} '
           f'mixed_precision={args.mixed_precision} attention={args.attention} '
+          f'compile={args.compile} '
           f'batch={args.batch_size} '
           f'ctx={context_length} params={n_params / 1e6:.1f}M')
 
@@ -237,6 +238,8 @@ def main():
     parser.add_argument('--attention', choices=['naive', 'flash-pytorch', 'flash-triton'], default='naive',
                         help='Swap the A1 model attention for our FlashAttention implementation.')
     parser.add_argument('--seed', type=int, default=123)
+    parser.add_argument('--compile', action='store_true',
+                        help='Wrap the model with torch.compile (default mode) before benchmarking.')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -244,6 +247,8 @@ def main():
 
     apply_attention_patch(args.attention)
     model = build_model(args).to(device)
+    if args.compile:
+        model = torch.compile(model)
     optimizer = AdamW(model.parameters(), lr=1e-4)
 
     vocab_size = MODEL_SIZES[args.model_size]['vocab_size']

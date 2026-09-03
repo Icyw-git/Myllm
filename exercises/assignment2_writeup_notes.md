@@ -530,3 +530,105 @@ kernel 已支持 bf16/fp16 输入（tensor core + fp32 累加）; 两边都跑 -
 4. flash-pytorch 最慢（Python 循环, 每 N 块 5 个小 matmul 走 autograd 调度）,
    flash-triton 融合版快它 2-4×——再次印证 §8.4 的"分块算法≠快, 融合才是"
 5. 显存比随 N 单调下降（54.8%→9.1%→3.3%）: 分子线性分母平方, 与 §8.2 forward 同律
+
+## 9. gradient checkpointing（§3, 4 分）
+
+### 9.1 (a) 显存最优策略的理论
+
+记账模型（handout 假设: 单个 block 的 residuals 主导一切簿记开销）:
+- 每个 block 的 residuals（backward 需要的激活）= 1 单位; N 个 block
+- checkpoint 一个位置 = 存 1 单位"边界激活"（该 block 的输入）
+- 重算 = 重跑 forward 恢复该段内部 residuals（一段 k 个 block ≈ c·k 单位, c = 每 block 的 residual 个数, 量级 ~8）
+
+三种策略对比:
+
+| 策略 | 峰值激活 | forward 次数 |
+|---|---|---|
+| 不 checkpoint | N | 1 |
+| 单层分段（每段 k 块） | N/k + c·k | 2 |
+| 递归嵌套（每层分 b 份） | b·log_b N = O(log N) | log_b N + 1 |
+
+- 单层分段: 峰值(k) = N/k + c·k → 极值 **k* = √(N/c)**, 峰值 = 2√(cN)
+  （两边各贡献一半: 边界 checkpoint 的 N/k 与重算段的 c·k 相等时最优）
+- 递归嵌套: 峰值满足 f(N) = b + f(N/b), f(1)=1 → f(N) = b·log_b N;
+  对 b 求导最优 **b = e ≈ 3**, 峰值 ≈ 3·log₃N = O(log N),
+  代价是每个 block 的 forward 跑 O(log N) 遍
+- 代码草图: 递归函数把当前段分 3 份, 存 3 个子段输入 checkpoint, backward 时递归重算
+
+(b) 是 (a) 的受限版: 只许重算一遍（不许嵌套）→ 在单层分段里找最优 k,
+用 k* = √(N/c) 与实验对照。
+
+### 9.2 (b) xl b4 s2048 的最优段大小（exercises/bench_checkpointing.py, 待跑）
+
+3090 适配声明: xl full step 固定开销 16B/参数 × 3.41B ≈ 54.6GB > 24GB;
+large 也实测全 k OOM（固定 21.5GB + 最少激活即超限）→ checkpointing 只省激活、
+救不了参数/梯度/优化器状态。full step 用 medium（0.42B, 固定 6.8GB）复现规律,
+xl 用 forward-only 验证。
+
+**medium full step, fp32, b4 s2048, naive attention**:
+
+| k(块/段) | 段数 | ms/step | 峰值MB | 备注 |
+|---|---|---|---|---|
+| 0（基线） | - | - | OOM | 24 块 × ~2GB 内部激活 |
+| **1** | 24 | 3662.8 | **13113** | **谷底 = 每块都 checkpoint** |
+| 2 | 12 | 3718.3 | 16062 | 重算 2 块, +3.0GB |
+| 4 | 6 | 3726.9 | 21965 | 重算 4 块, +5.9GB |
+| 8 | 3 | - | OOM | 重算 8 块 ≈ +16GB |
+
+关键分析: 谷底在 k=1 而非理论 k* = √(N/c) ≈ 2, 因为 **c 被低估**——
+naive attention 下每 block 的 backward 需保存 attention scores
+（b4·h12·2048²·4B ≈ 805MB）+ softmax 输出（再 805MB）,
+单个 block ≈ **62 个残差流单位（c≈62 ≫ N/4）** → N/k 项可忽略,
+峰值 ≈ 固定 + c·k·C 随 k 单调增, 最小允许 k=1 即最优。
+handout 的"next smaller/larger 对比"= k=1 vs k=2 vs k=4（k<1 不存在）。
+时间代价: 2× forward ≈ +1.6%~54% 视 k 而定（这里 3.66s vs 3.73s, 差异被
+通信/碎片掩盖, 重算本身约 +1 遍 fwd 的算力）。
+
+**flash 对照实测**（medium full step, fp32, `--attention flash-pytorch`）:
+
+| k(块/段) | naive 峰值MB | flash 峰值MB |
+|---|---|---|
+| 0（基线） | OOM | OOM |
+| **1** | 13113 | **7986（-39%）** |
+| 2 | 16062 | 8913 |
+| 4 | 21965 | 10770 |
+| 8 | OOM | 14484 |
+| 16 | OOM | 21915 |
+
+修正后的完整结论:
+1. flash 只消灭 scores/softmax（~50 单位/块）, 每块 residual 仍 ≈ **25-30 单位**
+   （SwiGLU 的 d_ff 中间量 134MB×2 + q/k/v/o + 双 RMSNorm fp32 保存量）,
+   ×24 块 ≈ 20GB → **k=0 仍 OOM**; 但 k=1 峰值 13.1→8.0GB（-39%）
+2. c≈30 仍 ≫ N=24 → k* = √(24/30) < 1 → **谷底仍在 k=1**。
+   U 型曲线的谷底右移需要 c ~ N 量级（更深模型）; c ≫ N 时最小 k 恒最优。
+   k* = √(N/c) 公式方向正确, 谷底位置由 c/N 相对大小决定
+3. **flash 与 checkpointing 作用在不同项上**（flash 砍 c, checkpoint 砍重算段的
+   c·k 项之外的边界项）, 可叠加: flash + k=1 = 8.0GB, 让 medium b4 s2048
+   full step 从 naive 的 OOM 降到 8GB 内
+4. 递归嵌套（9.1）在此场景可把峰值进一步压向 O(log N), 但 handout (b) 限制
+   一次重算, 故不展开实验
+
+**xl forward-only 实测**（fp32, b4 s2048; 无 backward → 无重算, 曲线方向反转）:
+
+| k(块/段) | 段数 | 峰值MB | 备注 |
+|---|---|---|---|
+| 0 | - | OOM | 32 块 × ~2GB+ 内部激活全保留 |
+| 1 | 32 | OOM | 32 边界 × 80MiB = 2.5GB → 顶破 24GB |
+| 2 | 16 | 23011 | |
+| 4 | 8 | 22371 | |
+| 8 | 4 | 22051 | |
+| 16 | 2 | 21891 | |
+| **32** | 1 | **21811** | 最优 = 整模型一段 |
+
+fwd-only 模型: 峰值 = 13.6GB(参数) + ~8.2GB(单 block forward 瞬时峰值:
+scores 2.1GB + softmax 2.1GB 等, **任何 checkpoint 粒度都压不掉**)
++ 80MiB × N/k(边界数)。k 越大段越少 → 边界越少 → 峰值单调降 → k=32 最优。
+实测 k=2 与 k=32 的差 1.2GB ≈ 15×80MiB 边界差 ✓。
+**结论分叉**: U 型曲线（存在最优中间 k）只在 full step 出现——重算项 c·k
+随 k 上升; fwd-only 只有单调下降项。handout (b) 的答案以 medium full step 为准:
+**每块都 checkpoint（k=1）最优**。
+
+(注: 脚本"激活MB(估)"列按 full step 的 U 型公式估算, 对 fwd-only 模式不适用,
+以上表实测值为准。)
+
+待填: flash 对照表（medium full step + flash-pytorch, 预测 k=0 可跑、谷底右移到 k=2）。
