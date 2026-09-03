@@ -127,6 +127,9 @@ def main():
                         print(f'{name},{d},{N},OOM,,')
                     else:
                         raise
+                except Exception as e:  # dynamo 无法 trace 带循环的自定义 autograd Function
+                    torch.cuda.empty_cache()
+                    print(f'{name},{d},{N},COMPILE_FAIL,{type(e).__name__},')
                 torch.cuda.empty_cache()
 
 

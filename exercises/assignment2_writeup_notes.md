@@ -632,3 +632,93 @@ scores 2.1GB + softmax 2.1GB 等, **任何 checkpoint 粒度都压不掉**)
 以上表实测值为准。)
 
 待填: flash 对照表（medium full step + flash-pytorch, 预测 k=0 可跑、谷底右移到 k=2）。
+
+## 10. 官方 attention 网格（4.1.1: naive vs flash, B=8, fp32, 100 次计时）
+
+脚本: sweep_attention.py（默认参数即官方网格; mem_MB = 单次带梯度 forward 的
+allocator 峰值净增 = op 激活占用）。d=64 列（其余 d 几乎相同）:
+
+| N | naive fwd ms | naive bwd ms | naive mem MB | flash-py fwd ms | flash-py bwd ms | flash-py mem MB |
+|---|---|---|---|---|---|---|
+| 256 | 0.29 | 2.16 | 8.0 | 0.49 | 3.64 | 4.5 |
+| 512 | 0.43 | 2.22 | 32.0 | 1.18 | 5.55 | 9.1 |
+| 1024 | 0.63 | 2.18 | 128.1 | 2.31 | 13.15 | 18.1 |
+| 2048 | 2.33 | 8.25 | 512.2 | 4.31 | 23.81 | 36.2 |
+| 4096 | 9.26 | 32.36 | 2048.4 | 12.03 | 52.97 | 72.5 |
+| 8192 | 36.08 | 125.96 | 8192.8 | 44.07 | 205.39 | 145.0 |
+| 16384 | **OOM** | - | (需 32GB+) | 168.17 | 792.95 | 290.0 |
+
+结论:
+1. **naive 显存严格 = 16·B·N² 字节**（N=256: 8.0MB, N=8192: 8192.8MB, 逐点吻合:
+   S+P+两个中间量, 每个 B·N²·4B）。N=16384 需 ~34GB → OOM, flash 同点仅 266-386MB
+   （**~30-60×**）, 完整跑通 —— O(N²) vs O(N) 的直接证据
+2. **速度交叉点未到**: fp32+B=8 下 naive (cuBLAS 大 GEMM) 在 fwd 上一直更快
+   （8192: 36.1 vs 44.1ms）, flash-pytorch 的速度劣势随 N 缩小;
+   naive 的败因是 N=16384 直接 OOM —— flash 的价值在"能跑", 其次才是快
+3. **d 不变性**: 时间/显存对 d∈{16..128} 几乎不敏感（N² 项主导, d·N 项小）
+   —— 4 张 d 表可合并成一张
+
+## 11. torch.compile 对照（4.2a: naive±compile, B=8, fp32, d=64, 100 次计时）
+
+| N | fwd ms (原/编译) | 提速 | bwd ms (原/编译) | 提速 | mem MB (原/编译) |
+|---|---|---|---|---|---|
+| 256 | 0.28 / 0.25 | 1.2× | 1.62 / 1.06 | 1.5× | 8.0 / 4.5 |
+| 1024 | 0.63 / 0.31 | **2.1×** | 2.51 / 2.10 | 1.2× | 128.1 / 66.1 |
+| 4096 | 9.19 / 5.31 | 1.7× | 32.15 / 17.63 | 1.8× | 2048.4 / 1032.5 |
+| 8192 | 35.86 / 21.12 | 1.7× | 125.15 / 68.33 | 1.8× | 8192.8 / **4113.0** |
+
+结论:
+1. **速度 +70%~110%**（inductor 融合了 softmax 链的小算子 + 减少 kernel launch）
+2. **显存精确减半**（8192.8→4113.0, 128.1→66.1）: naive 的 4 份 B·N²·4B 缓冲
+   （S + softmax 输出 + 2 中间量）被 inductor 融合成 2 份 —— 仍是 O(N²), 但常数减半
+3. **编译后的 naive 反超 flash-pytorch**: fwd 21.1 vs 44.1ms @8192 ——
+   flash-pytorch 的 Python 循环开销是硬伤; flash 的相对优势只剩显存（145MB vs 4.1GB）
+4. **flash 系无法被 compile**: dynamo 无法 trace 带逐块 Python 循环的自定义
+   autograd Function（`range(0, n_k, block)` 的动态边界 → ConstantVariable 断言失败）。
+   "编译"与"Python 级分块"在当前工具链下不可兼得 —— 生产实现走 kernel 融合
+   （我们的 Triton 路线）正是为了绕开这个限制
+
+## 12. flash 官方大表（4.2.2: B=1, causal, bf16, 20 次计时, d=64 列）
+
+| N | naive fwd/bwd ms | flash-triton fwd/bwd ms | triton 提速(fwd) | naive mem | triton mem |
+|---|---|---|---|---|---|
+| 512 | 0.53 / 2.36 | 0.31 / 0.82 | 1.7× | 2.3MB | 0.1MB |
+| 1024 | 0.69 / 2.60 | 0.31 / 1.31 | 2.2× | 9.0MB | 0.1MB |
+| 4096 | 0.84 / 2.70 | 0.31 / 1.32 | 2.7× | 144MB | 0.5MB |
+| 8192 | 2.82 / 8.43 | 0.32 / 1.31 | **8.9×** | 576MB | 1.0MB |
+| 16384 | 11.18 / 33.29 | **1.00 / 3.30** | **11×** | 2304MB | **2.1MB（1100×）** |
+
+(flash-pytorch 全程最慢: N=16384 fwd 44.4ms, 比 naive 还慢 4× —— Python 循环开销
+在 bf16 下更加显眼。)
+
+结论:
+1. **速度首次反超且随 N 扩大**: 1.7×(512) → 11×(16384)。bf16 让 naive 也吃到
+   tensor core, 但 naive 的 N² 显存流量成为瓶颈; triton 不物化 S/P, 纯算力比拼
+2. **fwd 达成率 ≈ 96%**: N=16384 causal fwd FLOPs = 2·N²·d = 34.4 GFLOP,
+   / 1.004ms = **34.3 TFLOP/s ≈ 3090 bf16+fp32-accum 峰值(35.5) 的 96%** ——
+   kernel 已从 launch/访存受限进入 compute-bound 饱和区
+3. **N ≤ 8192 时 triton fwd 恒为 0.31ms**（launch/占用率地板）: B=1 时 grid 只有
+   N/64 个 program, N=4096 才 64 个 < 82 SM → 未填满 GPU。B>1 的真实训练里
+   这个地板会被并行度掩盖
+4. **显存 1100×**: 2304MB vs 2.1MB @16384（bf16 下 naive 只物化 2 份 N²,
+   flash 恒为 O(N)）
+5. **d 的代价**: d=128 在大 N 变慢（fwd 2.29 vs 1.00ms）—— smem 压力掉占用率,
+   与 8.6 的教训一致
+
+## 13. torch.compile 整模型端到端（4.2b: benchmark.py --compile, full step, fp32, b4 ctx512）
+
+| 配置 | 每步 | TFLOP/s | 峰值显存 |
+|---|---|---|---|
+| small 非 compile（实测基线） | 170.9ms | 9.98 | 5.40GB |
+| small --compile | **134.8ms（1.27×）** | **12.59（+26%）** | **4.63GB（-0.77GB）** |
+| medium 非 compile（8.3 基线） | 508.9ms | 10.8 | 14.74GB |
+| medium --compile | **417.3ms（1.22×）** | **13.18（+22%）** | **12.71GB（-2.0GB）** |
+
+结论:
+1. 端到端 +22% 算力 / 1.22× 提速: 整模型 fused 的大头在逐层小算子
+   （RMSNorm/RoPE/SwiGLU/残差加), attention 的 N² 部分只占一步的 ~8%
+2. 显存 -2.0GB(-14%): 8.3 的激活 ≈ 9.6GB 里, inductor 融合省出 2GB
+   （attention 缓冲减半 + 逐层中间量合并）
+3. 注意 compile 用时 ~40s（逐 shape 编译）, 推理/长训场景才划算;
+   TF32 未开启（inductor 警告）—— 若允许 set_float32_matmul_precision('high'),
+   GEMM 部分还能再快, 但精度语义变化需在 writeup 声明
