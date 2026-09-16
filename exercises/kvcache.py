@@ -73,14 +73,19 @@ class multihead_attn_with_rope(nn.Module):
         self.w_v=nn.Linear(d_model,d_model)
         self.w_o=nn.Linear(d_model,d_model)
 
-    def rope(self,x:Tensor,theta:float=10000.0,)->Tensor:
+    def rope(self,x:Tensor,theta:float=10000.0,past_kv:dict[Tensor,Tensor]=None)->Tensor:
         *lead,seq_len,d_model=x.shape
         
         assert d_model %2==0
         d_k=d_model //2
         xr=rearrange(x,'... t (dk two) -> ... t dk two',two=2)
         range=torch.arange(d_k,device=x.device,dtype=x.dtype)
-        ids=torch.arange(seq_len,device=x.device,dtype=x.dtype)
+        if past_kv:
+            cache_len=past_kv['k'].shape[2] if 'k' in past_kv else 0
+            ids=torch.arange(cache_len,cache_len+seq_len,device=x.device,dtype=x.dtype)
+        else:
+
+            ids=torch.arange(seq_len,device=x.device,dtype=x.dtype)
         theta_list=einsum(ids,theta**(-2*range/d_model),'i, j -> i j') # 分母是 head_dim，不是 d_k
         
         x0=xr[...,0]*torch.cos(theta_list)-xr[...,1]*torch.sin(theta_list) #[...,0]是取最后一维的第0个元素，[:,1]是取第二维的第1个
@@ -96,7 +101,7 @@ class multihead_attn_with_rope(nn.Module):
 
 
 
-    def forward(self,input:Tensor,causal:bool=True):
+    def forward(self,input:Tensor,causal:bool=True,past_kv:dict[Tensor,Tensor]=None):
         batch_size,seq_len,d_model=input.shape
         q=self.w_q(input)
         k=self.w_k(input)
@@ -110,21 +115,33 @@ class multihead_attn_with_rope(nn.Module):
         k=rearrange(k,'b t (h d) -> b h t d',h=self.num_heads)
         v=rearrange(v,'b t (h d) -> b h t d',h=self.num_heads)
 
-        q=self.rope(q)
-        k=self.rope(k)
+        q=self.rope(q,past_kv=past_kv)
+        k=self.rope(k,past_kv=past_kv)
+
+        if past_kv:
+            k=torch.cat([past_kv['k'],k],dim=2)
+            v=torch.cat([past_kv['v'],v],dim=2)
+
+
 
 
 
         
         attn=einsum(q,k,'b h t d, b h s d -> b h t s')/math.sqrt(self.head_model)
         if causal:
-            mask=torch.triu(torch.ones(seq_len,seq_len,device=input.device,dtype=torch.bool),diagonal=1)
+            k_len=k.shape[2]                                  # = cache_len + seq_len
+            q_pos=torch.arange(k_len-seq_len,k_len,device=input.device,dtype=torch.float32)
+            k_pos=torch.arange(k_len,device=input.device,dtype=torch.float32)
+            mask=q_pos[:,None]<k_pos[None,:]
             attn=attn.masked_fill(mask,float('-inf'))
+
+
         score=softmax(attn)
 
         output=einsum(score,v,'b h t s, b h s d -> b h t d')
         output=rearrange(output,'b h t d -> b t (h d)')
-        return self.w_o(output)
+        new_kv={'k':k,'v':v}
+        return self.w_o(output),new_kv
 
 
 class SwiGLU(nn.Module):
@@ -152,10 +169,11 @@ class TransformerBlock(nn.Module):
         self.ffn=SwiGLU(d_model,d_ff)
         
 
-    def forward(self,input:Tensor,causal:bool=True)->Tensor:
-        x=input+self.attn(self.norm1(input),causal)  # 残差绕开 norm
+    def forward(self,input:Tensor,causal:bool=True,past_kv:dict[Tensor,Tensor]=None)->Tensor:
+        output,new_kv=self.attn(self.norm1(input),causal,past_kv)
+        x=input+output  # 残差绕开 norm
         x=x+self.ffn(self.norm2(x))
-        return x
+        return x,new_kv
 
 class TransformerLM(nn.Module):
     def __init__(self,d_model:int,num_heads:int,num_blocks:int,d_ff:int,vocab_size:int):
@@ -163,10 +181,15 @@ class TransformerLM(nn.Module):
         self.blocks=nn.ModuleList([TransformerBlock(d_model,num_heads,d_ff) for _ in range(num_blocks)])
         self.out=nn.Linear(d_model,vocab_size)
         
-    def forward(self,input:Tensor,causal:bool=True)->Tensor:
-        for blk in self.blocks:
-            input=blk(input,causal)
-        return self.out(input)
+    def forward(self,input:Tensor,causal:bool=True,past_kvs:list[dict[Tensor,Tensor]]=None)->Tensor:
+        new_kvs=[]
+        for i,blk in enumerate(self.blocks):
+            past=past_kvs[i] if past_kvs else None
+
+            input,new_kv=blk(input,causal,past_kv=past)
+            new_kvs.append(new_kv)
+
+        return self.out(input),new_kvs
 
 
 
@@ -197,8 +220,9 @@ if __name__ =="__main__":
 
     input=torch.rand((4,10,256),dtype=torch.bfloat16)
     out=TransformerLM(256,8,2,1024,1000).to(input.device,input.dtype) # device 和 dtype 都要一致
-    out=out(input)
+    out,new_kvs=out(input)
 
-    print(out)
+    print(out.shape)
+    print(new_kvs[0]['k'].shape)
 
 
