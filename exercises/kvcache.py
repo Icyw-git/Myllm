@@ -1,9 +1,11 @@
+from accelerate.utils import id_tensor_storage
 import torch
 import torch.nn as nn
 import math
 from torch import Tensor # 张量类型
 from einops import einsum, rearrange,repeat,reduce
 import einops
+from transformers.utils.dummy_pt_objects import Idefics2Model
 torch.manual_seed(0)
 
 # 组件：RMSNorm
@@ -169,7 +171,7 @@ class TransformerBlock(nn.Module):
         self.ffn=SwiGLU(d_model,d_ff)
         
 
-    def forward(self,input:Tensor,causal:bool=True,past_kv:dict[Tensor,Tensor]=None)->Tensor:
+    def forward(self,input:Tensor,causal:bool=True,past_kv:dict[str,Tensor]=None)->Tensor:
         output,new_kv=self.attn(self.norm1(input),causal,past_kv)
         x=input+output  # 残差绕开 norm
         x=x+self.ffn(self.norm2(x))
@@ -178,10 +180,14 @@ class TransformerBlock(nn.Module):
 class TransformerLM(nn.Module):
     def __init__(self,d_model:int,num_heads:int,num_blocks:int,d_ff:int,vocab_size:int):
         super().__init__()
+        self.embedding=nn.Embedding(vocab_size,d_model)
+
         self.blocks=nn.ModuleList([TransformerBlock(d_model,num_heads,d_ff) for _ in range(num_blocks)])
         self.out=nn.Linear(d_model,vocab_size)
         
-    def forward(self,input:Tensor,causal:bool=True,past_kvs:list[dict[Tensor,Tensor]]=None)->Tensor:
+    def forward(self,ids,causal:bool=True,past_kvs:list[dict[str,Tensor]]=None)->Tensor:
+        input=self.embedding(ids)
+
         new_kvs=[]
         for i,blk in enumerate(self.blocks):
             past=past_kvs[i] if past_kvs else None
@@ -190,6 +196,91 @@ class TransformerLM(nn.Module):
             new_kvs.append(new_kv)
 
         return self.out(input),new_kvs
+
+@torch.no_grad()
+def greedy_generate(model,prompt_ids,max_new_tokens,use_cache:bool=True):
+    ids=prompt_ids
+    if use_cache:
+        logits,cache=model(ids,causal=True)
+        for _ in range(max_new_tokens):
+            next=logits[:,-1].argmax(-1,keepdim=True)
+            ids=torch.cat([ids,next],dim=1)
+            logits,cache=model(next,causal=True,past_kvs=cache) # 只喂新 token, 历史在 cache 里
+    else:
+        logits,cache=model(ids,causal=True)
+        for _ in range(max_new_tokens):
+            next=logits[:,-1].argmax(-1,keepdim=True)
+            ids=torch.cat([ids,next],dim=1)
+            logits,cache=model(ids,causal=True)
+
+    return ids
+
+
+def sample(logits:Tensor,temperature:float=1.0,top_p:float=None,top_k:int=None)->Tensor:
+    logits=logits/temperature
+    if top_k is not None:
+        k=min(top_k,logits.size(-1))
+        kth=logits.topk(k,dim=-1).values[...,-1,None]
+        mask=(logits<kth)
+        logits=logits.masked_fill(mask,float('-inf'))
+        
+
+    if top_p is not None:
+        sl,si=logits.sort(dim=-1,descending=True)          # 排序的是 logits
+        pr=softmax(sl)
+        cum=pr.cumsum(dim=-1)
+        sl=sl.masked_fill((cum-pr)>top_p,float('-inf'))    # 减 pr, 保证至少保留 1 个
+        logits=sl.scatter(-1,index=si,src=sl)                        # 还原的是 logits, 不是概率,重排回原来的顺序
+
+    next=torch.multinomial(softmax(logits),num_samples=1)
+    return next
+
+
+        
+
+
+
+
+
+        
+
+
+
+
+
+
+@torch.no_grad()
+def generate(model,prompt_ids,max_new_tokens,use_cache:bool=True,temperature:float=1.0,top_p:float=None,top_k:int=None):
+    ids=prompt_ids
+    if use_cache:
+        logits,cache=model(ids,causal=True)                         # prefill 整段
+        for _ in range(max_new_tokens):
+            next=sample(logits[:,-1],temperature,top_p,top_k)       # ① 取最后位置 → (B,V)
+            ids=torch.cat([ids,next],dim=1)                         # ② 沿序列维拼接
+            logits,cache=model(next,causal=True,past_kvs=cache)     # ③ 只喂新 token
+    else:
+        for _ in range(max_new_tokens):
+            logits,_=model(ids,causal=True)                         # ④ 不传 cache
+            next=sample(logits[:,-1],temperature,top_p,top_k)
+            ids=torch.cat([ids,next],dim=1)
+    return ids
+
+
+
+    
+
+
+
+
+
+
+
+
+
+        
+
+
+
 
 
 
@@ -218,11 +309,21 @@ if __name__ =="__main__":
     print(attn(input))
     print(attn.rope(input).shape)
 
-    input=torch.rand((4,10,256),dtype=torch.bfloat16)
-    out=TransformerLM(256,8,2,1024,1000).to(input.device,input.dtype) # device 和 dtype 都要一致
-    out,new_kvs=out(input)
+    ids=torch.randint(0,1000,(4,10))          # (B,T) long ← token ids, 不是 float
+    lm=TransformerLM(256,8,2,1024,1000)
+    logits,new_kvs=lm(ids)
 
-    print(out.shape)
+    print(logits.shape)
     print(new_kvs[0]['k'].shape)
+
+    model=TransformerLM(256,8,4,1024,1000)
+    prompt_ids=torch.tensor([[1,2,3,4,5]],dtype=torch.long)
+    generated_ids=greedy_generate(model,prompt_ids,10,use_cache=False)
+    print(generated_ids)
+
+    ids=generate(model,prompt_ids,10,top_p=0.7)
+    print(ids)
+
+    
 
 
