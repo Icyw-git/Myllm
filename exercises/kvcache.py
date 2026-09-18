@@ -100,9 +100,6 @@ class multihead_attn_with_rope(nn.Module):
 
 
 
-
-
-
     def forward(self,input:Tensor,causal:bool=True,past_kv:dict[Tensor,Tensor]=None):
         batch_size,seq_len,d_model=input.shape
         q=self.w_q(input)
@@ -144,6 +141,65 @@ class multihead_attn_with_rope(nn.Module):
         output=rearrange(output,'b h t d -> b t (h d)')
         new_kv={'k':k,'v':v}
         return self.w_o(output),new_kv
+
+
+
+class GQA(nn.Module):
+    def __init__(self,d_model:int,num_heads:int,num_kv_heads:int):
+        super().__init__()
+        self.d_model=d_model
+        self.num_heads=num_heads
+        self.num_kv_heads=num_kv_heads  
+        assert num_heads % num_kv_heads==0
+        self.head_dim=d_model//num_heads
+        self.group_size=num_heads//num_kv_heads
+        self.w_q=nn.Linear(d_model,d_model)
+        self.w_k=nn.Linear(d_model,num_kv_heads*self.head_dim)
+        self.w_v=nn.Linear(d_model,num_kv_heads*self.head_dim)
+        self.w_o=nn.Linear(d_model,d_model)
+
+    def repeat_kv(self,input:Tensor,n_repeat:int)->Tensor:
+        batch,num_kv_heads,seq_len,head_dim=input.shape
+        repeat_input=repeat(input,'b h t d -> b (h n_repeat) t d',n_repeat=n_repeat)
+        return repeat_input
+
+    def forward(self,input:Tensor,causal:bool=True,past_kv:dict[Tensor,Tensor]=None):
+        batch_size,seq_len,d_model=input.shape
+        q=self.w_q(input)
+        k=self.w_k(input)
+        v=self.w_v(input)
+
+        
+
+        q=rearrange(q,'b t (h d) -> b h t d',h=self.num_heads)
+        k=rearrange(k,'b t (h d) -> b h t d',h=self.num_kv_heads)
+        v=rearrange(v,'b t (h d) -> b h t d',h=self.num_kv_heads)
+
+        if past_kv:
+            k=torch.cat([past_kv['k'],k],dim=2)
+            v=torch.cat([past_kv['v'],v],dim=2)
+        new_kv={'k':k,'v':v}                        # ★ cache 存 H_kv 个(复制前)
+
+        k=self.repeat_kv(k,self.group_size)         # ★ 复制只为算 attention
+        v=self.repeat_kv(v,self.group_size)
+
+        attn=einsum(q,k,'b h t d, b h s d -> b h t s')/math.sqrt(self.head_dim)
+        if causal:
+            k_len=k.shape[2]                                  # = cache_len + seq_len
+            q_pos=torch.arange(k_len-seq_len,k_len,device=input.device,dtype=torch.float32)
+            k_pos=torch.arange(k_len,device=input.device,dtype=torch.float32)
+            mask=q_pos[:,None]<k_pos[None,:]
+            attn=attn.masked_fill(mask,float('-inf'))
+
+
+        score=softmax(attn)
+
+        output=einsum(score,v,'b h t s, b h s d -> b h t d')
+        output=rearrange(output,'b h t d -> b t (h d)')
+        return self.w_o(output),new_kv
+
+
+
 
 
 class SwiGLU(nn.Module):
