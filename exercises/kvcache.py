@@ -163,6 +163,25 @@ class GQA(nn.Module):
         repeat_input=repeat(input,'b h t d -> b (h n_repeat) t d',n_repeat=n_repeat)
         return repeat_input
 
+    def rope(self,x:Tensor,theta:float=10000.0,past_kv:dict[Tensor,Tensor]=None)->Tensor:
+        *lead,seq_len,d_model=x.shape
+
+        assert d_model %2==0
+        d_k=d_model //2
+        xr=rearrange(x,'... t (dk two) -> ... t dk two',two=2)
+        range=torch.arange(d_k,device=x.device,dtype=x.dtype)
+        if past_kv:
+            cache_len=past_kv['k'].shape[2] if 'k' in past_kv else 0
+            ids=torch.arange(cache_len,cache_len+seq_len,device=x.device,dtype=x.dtype)
+        else:
+            ids=torch.arange(seq_len,device=x.device,dtype=x.dtype)
+        theta_list=einsum(ids,theta**(-2*range/d_model),'i, j -> i j')
+
+        x0=xr[...,0]*torch.cos(theta_list)-xr[...,1]*torch.sin(theta_list)
+        x1=xr[...,1]*torch.cos(theta_list)+xr[...,0]*torch.sin(theta_list)
+
+        return rearrange([x0,x1],'two ... t dk -> ... t (dk two)')
+
     def forward(self,input:Tensor,causal:bool=True,past_kv:dict[Tensor,Tensor]=None):
         batch_size,seq_len,d_model=input.shape
         q=self.w_q(input)
@@ -174,6 +193,10 @@ class GQA(nn.Module):
         q=rearrange(q,'b t (h d) -> b h t d',h=self.num_heads)
         k=rearrange(k,'b t (h d) -> b h t d',h=self.num_kv_heads)
         v=rearrange(v,'b t (h d) -> b h t d',h=self.num_kv_heads)
+
+        q=self.rope(q,past_kv=past_kv)
+        k=self.rope(k,past_kv=past_kv)
+        
 
         if past_kv:
             k=torch.cat([past_kv['k'],k],dim=2)
