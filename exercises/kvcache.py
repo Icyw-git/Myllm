@@ -231,7 +231,7 @@ class GQA(nn.Module):
 
         output=einsum(score,v,'b h t s, b h s d -> b h t d')
         output=rearrange(output,'b h t d -> b t (h d)')
-        return self.w_o(output)
+        return self.w_o(output),new_kv
 
 
 
