@@ -75,20 +75,22 @@ class multihead_attn_with_rope(nn.Module):
         self.w_v=nn.Linear(d_model,d_model)
         self.w_o=nn.Linear(d_model,d_model)
 
-    def rope(self,x:Tensor,theta:float=10000.0,past_kv:dict[Tensor,Tensor]=None)->Tensor:
+    def rope(self,x:Tensor,theta:float=10000.0,past_kv:dict[Tensor,Tensor]=None,pos_ids:Tensor=None)->Tensor:
         *lead,seq_len,d_model=x.shape
         
         assert d_model %2==0
         d_k=d_model //2
         xr=rearrange(x,'... t (dk two) -> ... t dk two',two=2)
-        range=torch.arange(d_k,device=x.device,dtype=x.dtype)
-        if past_kv:
-            cache_len=past_kv['k'].shape[2] if 'k' in past_kv else 0
-            ids=torch.arange(cache_len,cache_len+seq_len,device=x.device,dtype=x.dtype)
+        freqs=theta**(-2*torch.arange(d_k,device=x.device,dtype=torch.float32)/d_model)
+        if pos_ids is not None:
+            theta_list=pos_ids.to(torch.float32)[...,None]*freqs      # (...,T,d_k) 变长: 每条序列各自的绝对位置
+        elif past_kv:
+            cache_len=past_kv['k'].shape[2]
+            ids=torch.arange(cache_len,cache_len+seq_len,device=x.device,dtype=torch.float32)
+            theta_list=einsum(ids,freqs,'i, j -> i j')
         else:
-
-            ids=torch.arange(seq_len,device=x.device,dtype=x.dtype)
-        theta_list=einsum(ids,theta**(-2*range/d_model),'i, j -> i j') # 分母是 head_dim，不是 d_k
+            ids=torch.arange(seq_len,device=x.device,dtype=torch.float32)
+            theta_list=einsum(ids,freqs,'i, j -> i j')
         
         x0=xr[...,0]*torch.cos(theta_list)-xr[...,1]*torch.sin(theta_list) #[...,0]是取最后一维的第0个元素，[:,1]是取第二维的第1个
         x1=xr[...,1]*torch.cos(theta_list)+xr[...,0]*torch.sin(theta_list)
@@ -100,40 +102,47 @@ class multihead_attn_with_rope(nn.Module):
 
 
 
-    def forward(self,input:Tensor,causal:bool=True,past_kv:dict[Tensor,Tensor]=None):
+    def forward(self,input:Tensor,causal:bool=True,past_kv=None,kv_cache=None,input_lens:Tensor=None):
         batch_size,seq_len,d_model=input.shape
         q=self.w_q(input)
         k=self.w_k(input)
         v=self.w_v(input)
-
-  
-
 
         # 先 view 成 (B,T,H,d)（从最后一维 D 切出 head），再 transpose 到 (B,H,T,d)
         q=rearrange(q,'b t (h d) -> b h t d',h=self.num_heads)
         k=rearrange(k,'b t (h d) -> b h t d',h=self.num_heads)
         v=rearrange(v,'b t (h d) -> b h t d',h=self.num_heads)
 
-        q=self.rope(q,past_kv=past_kv)
-        k=self.rope(k,past_kv=past_kv)
+        if kv_cache is not None:
+            # ===== 变长路径: 每条序列各自的位置和 mask =====
+            pos_ids=kv_cache.lens[:,None]+torch.arange(seq_len,device=input.device)[None,:]  # (B,T)
+            q=self.rope(q,pos_ids=pos_ids[:,None,:])     # (B,1,T) 加 head 维以便广播
+            k=self.rope(k,pos_ids=pos_ids[:,None,:])
+            k,v,lens=kv_cache.update(k,v,input_lens)     # 写入 buffer(跳过 padding); lens 已更新
+            k_len=k.shape[2]
+            k_pos=torch.arange(k_len,device=input.device)
+            attn=einsum(q,k,'b h t d, b h s d -> b h t s')/math.sqrt(self.head_model)
+            if causal:
+                cm=pos_ids[:,:,None]<k_pos[None,None,:]                  # (B,T,k_len) 不看未来
+                invalid=k_pos[None,:]>=lens[:,None]                      # (B,k_len)   不看未写入
+                mask=cm|invalid[:,None,:]                                # (B,T,k_len)
+                attn=attn.masked_fill(mask[:,None,:,:],float('-inf'))    # ★ 补 head 维
+        else:
+            # ===== 等长路径(原逻辑, 已验证) =====
+            q=self.rope(q,past_kv=past_kv)
+            k=self.rope(k,past_kv=past_kv)
 
-        if past_kv:
-            k=torch.cat([past_kv['k'],k],dim=2)
-            v=torch.cat([past_kv['v'],v],dim=2)
+            if past_kv:
+                k=torch.cat([past_kv['k'],k],dim=2)
+                v=torch.cat([past_kv['v'],v],dim=2)
 
-
-
-
-
-        
-        attn=einsum(q,k,'b h t d, b h s d -> b h t s')/math.sqrt(self.head_model)
-        if causal:
-            k_len=k.shape[2]                                  # = cache_len + seq_len
-            q_pos=torch.arange(k_len-seq_len,k_len,device=input.device,dtype=torch.float32)
-            k_pos=torch.arange(k_len,device=input.device,dtype=torch.float32)
-            mask=q_pos[:,None]<k_pos[None,:]
-            attn=attn.masked_fill(mask,float('-inf'))
-
+            attn=einsum(q,k,'b h t d, b h s d -> b h t s')/math.sqrt(self.head_model)
+            if causal:
+                k_len=k.shape[2]
+                q_pos=torch.arange(k_len-seq_len,k_len,device=input.device,dtype=torch.float32)
+                k_pos=torch.arange(k_len,device=input.device,dtype=torch.float32)
+                mask=q_pos[:,None]<k_pos[None,:]
+                attn=attn.masked_fill(mask,float('-inf'))
 
         score=softmax(attn)
 
@@ -163,19 +172,22 @@ class GQA(nn.Module):
         repeat_input=repeat(input,'b h t d -> b (h n_repeat) t d',n_repeat=n_repeat)
         return repeat_input
 
-    def rope(self,x:Tensor,theta:float=10000.0,past_kv:dict[Tensor,Tensor]=None)->Tensor:
+    def rope(self,x:Tensor,theta:float=10000.0,past_kv:dict[Tensor,Tensor]=None,pos_ids:Tensor=None)->Tensor:
         *lead,seq_len,d_model=x.shape
 
         assert d_model %2==0
         d_k=d_model //2
         xr=rearrange(x,'... t (dk two) -> ... t dk two',two=2)
-        range=torch.arange(d_k,device=x.device,dtype=x.dtype)
-        if past_kv:
-            cache_len=past_kv['k'].shape[2] if 'k' in past_kv else 0
-            ids=torch.arange(cache_len,cache_len+seq_len,device=x.device,dtype=x.dtype)
+        freqs=theta**(-2*torch.arange(d_k,device=x.device,dtype=torch.float32)/d_model)
+        if pos_ids is not None:
+            theta_list=pos_ids.to(torch.float32)[...,None]*freqs
+        elif past_kv:
+            cache_len=past_kv['k'].shape[2]
+            ids=torch.arange(cache_len,cache_len+seq_len,device=x.device,dtype=torch.float32)
+            theta_list=einsum(ids,freqs,'i, j -> i j')
         else:
-            ids=torch.arange(seq_len,device=x.device,dtype=x.dtype)
-        theta_list=einsum(ids,theta**(-2*range/d_model),'i, j -> i j')
+            ids=torch.arange(seq_len,device=x.device,dtype=torch.float32)
+            theta_list=einsum(ids,freqs,'i, j -> i j')
 
         x0=xr[...,0]*torch.cos(theta_list)-xr[...,1]*torch.sin(theta_list)
         x1=xr[...,1]*torch.cos(theta_list)+xr[...,0]*torch.sin(theta_list)
@@ -219,7 +231,7 @@ class GQA(nn.Module):
 
         output=einsum(score,v,'b h t s, b h s d -> b h t d')
         output=rearrange(output,'b h t d -> b t (h d)')
-        return self.w_o(output),new_kv
+        return self.w_o(output)
 
 
 
@@ -250,8 +262,8 @@ class TransformerBlock(nn.Module):
         self.ffn=SwiGLU(d_model,d_ff)
         
 
-    def forward(self,input:Tensor,causal:bool=True,past_kv:dict[str,Tensor]=None)->Tensor:
-        output,new_kv=self.attn(self.norm1(input),causal,past_kv)
+    def forward(self,input:Tensor,causal:bool=True,past_kv=None,kv_cache=None,input_lens=None)->Tensor:
+        output,new_kv=self.attn(self.norm1(input),causal,past_kv,kv_cache,input_lens)
         x=input+output  # 残差绕开 norm
         x=x+self.ffn(self.norm2(x))
         return x,new_kv
@@ -264,14 +276,15 @@ class TransformerLM(nn.Module):
         self.blocks=nn.ModuleList([TransformerBlock(d_model,num_heads,d_ff) for _ in range(num_blocks)])
         self.out=nn.Linear(d_model,vocab_size)
         
-    def forward(self,ids,causal:bool=True,past_kvs:list[dict[str,Tensor]]=None)->Tensor:
+    def forward(self,ids,causal:bool=True,past_kvs=None,kv_caches=None,input_lens=None)->Tensor:
         input=self.embedding(ids)
 
         new_kvs=[]
         for i,blk in enumerate(self.blocks):
             past=past_kvs[i] if past_kvs else None
+            kc=kv_caches[i] if kv_caches else None
 
-            input,new_kv=blk(input,causal,past_kv=past)
+            input,new_kv=blk(input,causal,past_kv=past,kv_cache=kc,input_lens=input_lens)
             new_kvs.append(new_kv)
 
         return self.out(input),new_kvs
@@ -295,6 +308,33 @@ def greedy_generate(model,prompt_ids,max_new_tokens,use_cache:bool=True):
     return ids
 
 
+@torch.no_grad()
+def generate_kvcache(model,prompt_ids,max_new_tokens,eos_id:int=None,
+                     prompt_lens:Tensor=None,temperature:float=1.0,top_p:float=None,top_k:int=None):
+    """用 KVCache 的生成循环: 预分配 buffer + 变长 lens + EOS 标记.
+    prompt_ids: (B,T0) 右 padding; prompt_lens: (B,) 每条序列的有效 prompt 长度."""
+    B,T0=prompt_ids.shape
+    if prompt_lens is None:
+        prompt_lens=torch.full((B,),T0,dtype=torch.long)
+    a=model.blocks[0].attn
+    head_dim=a.head_model if hasattr(a,'head_model') else a.head_dim
+    num_kv=a.num_heads
+    caches=[KVCache(B,num_kv,T0+max_new_tokens,head_dim) for _ in model.blocks]
+
+    ids=prompt_ids
+    logits,_=model(ids,causal=True,kv_caches=caches,input_lens=prompt_lens)   # prefill
+    last=logits[torch.arange(B),prompt_lens-1]        # ★ 取每条序列最后一个有效位置
+    for _ in range(max_new_tokens):
+        nxt=sample(last,temperature,top_p,top_k)
+        ids=torch.cat([ids,nxt],dim=1)
+        if eos_id is not None:
+            for c in caches:
+                c.set_finished(nxt,eos_id)            # ★ 标记已结束
+        logits,_=model(nxt,causal=True,kv_caches=caches)   # decode: 每条 1 个
+        last=logits[:,-1]
+    return ids
+
+
 def sample(logits:Tensor,temperature:float=1.0,top_p:float=None,top_k:int=None)->Tensor:
     logits=logits/temperature
     if top_k is not None:
@@ -315,7 +355,50 @@ def sample(logits:Tensor,temperature:float=1.0,top_p:float=None,top_k:int=None)-
     return next
 
 
+
+class KVCache():
+    def __init__(self,batch_size:int,num_kv_heads:int,max_len:int,head_dim:int):
+        self.batch_size=batch_size
         
+        self.k_cache=torch.zeros((batch_size,num_kv_heads,max_len,head_dim))
+        self.v_cache=torch.zeros((batch_size,num_kv_heads,max_len,head_dim))
+        self.lens=torch.zeros((batch_size,),dtype=torch.long)
+        self.finished=torch.zeros((batch_size,),dtype=torch.bool)
+
+    def update(self,new_k:Tensor,new_v:Tensor,input_lens:Tensor=None):
+        """把本次 K/V 写到各序列的 lens 位置, 返回整个 buffer 和 lens.
+        new_k/new_v: (B, H_kv, T, head_dim)
+        input_lens : (B,) 本步每条序列的「有效 token 数」(右 padding); None = 全有效"""
+        T=new_k.shape[2]
+        if input_lens is None:
+            input_lens=torch.full((self.batch_size,),T,dtype=torch.long,device=self.lens.device)
+        for i in range(self.batch_size):
+            n=int(input_lens[i])
+            if n<=0: continue
+            L=int(self.lens[i])
+            self.k_cache[i,:,L:L+n,:]=new_k[i,:,:n,:]      # ★ 只写前 n 个, padding 不进 cache
+            self.v_cache[i,:,L:L+n,:]=new_v[i,:,:n,:]
+            self.lens[i]=L+n
+        return self.k_cache,self.v_cache,self.lens
+
+    def invalid_mask(self):
+        """(B, max_len) bool, True = 尚未写入的位置(应屏蔽)"""
+        pos=torch.arange(self.k_cache.shape[2],device=self.lens.device)
+        return pos[None,:]>=self.lens[:,None]
+
+    def set_finished(self,tokens:Tensor,eos_id:int):
+        """tokens: (B,1) → 更新 finished 标记"""
+        self.finished=self.finished|(tokens.squeeze(-1)==eos_id)
+        return self.finished
+
+    
+
+
+
+    
+
+
+
 
 
 
